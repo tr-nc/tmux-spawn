@@ -146,13 +146,32 @@ export default function (pi: ExtensionAPI) {
         settings = JSON.parse(readFileSync(settingsFile, "utf-8"));
       }
       settings.quietStartup = true;
+
+      // write a signal extension so the subagent notifies us when idle
+      const extDir = join(configDir, "extensions");
+      mkdirSync(extDir, { recursive: true });
+      writeFileSync(join(extDir, "spawn-signal.ts"), [
+        'import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";',
+        "export default function (pi: ExtensionAPI) {",
+        "  let signaled = false;",
+        '  pi.on("agent_end", async (_event) => {',
+        "    if (signaled) return;",
+        "    signaled = true;",
+        '    const id = process.env.PI_SPAWN_SIGNAL_ID;',
+        '    if (id) await pi.exec("tmux", ["wait-for", "-U", id]);',
+        "  });",
+        "}",
+        "",
+      ].join("\n"));
+      const exts = (settings.extensions as string[]) || [];
+      settings.extensions = [...exts, "extensions/spawn-signal.ts"];
+
       writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + "\n");
 
-      // build shell command that launches pi interactively with the initial prompt,
-      // properly escaped for shell single-quote safety
+      // build shell command with a signal for when the subagent becomes idle
+      const signalId = `pi-spawn-idle-${Date.now()}`;
       let shellCmd: string;
       if (prompt) {
-        // inject context so the subagent knows where it came from
         const sessionFile = ctx.sessionManager?.getSessionFile?.() ?? "";
         const cwd = process.cwd();
         const contextualized = [
@@ -168,6 +187,7 @@ export default function (pi: ExtensionAPI) {
         shellCmd = [
           `export PATH="${nodeDir}:${cargoDir}:$PATH"`,
           `export PI_CODING_AGENT_DIR="${configDir}"`,
+          `export PI_SPAWN_SIGNAL_ID="${signalId}"`,
           `${piBin} --model deepseek/deepseek-v4-flash --thinking off '${escaped}'`,
         ].join("; ");
       } else {
@@ -177,6 +197,9 @@ export default function (pi: ExtensionAPI) {
           `${piBin} --model deepseek/deepseek-v4-flash --thinking off`,
         ].join("; ");
       }
+
+      // lock the channel before spawning so the subagent can unlock it
+      if (prompt) await pi.exec("tmux", ["wait-for", "-L", signalId]);
 
       const result = await pi.exec("tmux", [
         "split-window", "-P", "-F", "#{pane_id}",
@@ -203,6 +226,12 @@ export default function (pi: ExtensionAPI) {
         ? `Spawned "${name}" ${direction}\nTask Assigned: ${prompt}`
         : `Spawned "${name}" ${direction}`;
       ctx.ui.notify(note, "info");
+
+      // wait for the subagent to finish its initial task
+      if (prompt) {
+        await pi.exec("tmux", ["wait-for", signalId]);
+        ctx.ui.notify(`Agent "${name}" finished`, "info");
+      }
     },
   });
 }
