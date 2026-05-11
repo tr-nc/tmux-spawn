@@ -200,7 +200,7 @@ export default function (pi: ExtensionAPI) {
       ]);
 
       const note = prompt
-        ? `Spawned "${name}" ${direction}\nTask Given: ${prompt}`
+        ? `Spawned "${name}" ${direction}\nTask Assigned: ${prompt}`
         : `Spawned "${name}" ${direction}`;
       ctx.ui.notify(note, "info");
     },
