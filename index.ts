@@ -36,6 +36,7 @@ async function parseWithLLM(
     "The subagent is already created — its task is the action it performs, not creating anything.",
     "",
     "If no name is explicitly given, pick a short memorable single word.",
+    "If the input is only a name (no task/prompt), set task to empty string.",
     "Return ONLY a JSON object like {\"name\":\"bob\",\"task\":\"build auth module\"}.",
     "No markdown, no code fences, no explanation.",
   ].join("\n");
