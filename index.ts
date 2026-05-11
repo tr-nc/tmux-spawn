@@ -49,6 +49,8 @@ export default function (pi: ExtensionAPI) {
       }
       const piBin = whichPi.stdout.trim();
       const nodeDir = join(whichNode.stdout.trim(), "..");
+      const cargoDir = join(homedir(), ".cargo", "bin");
+
 
       // copy the user's real pi config (settings + auth) into a temp dir and
       // add quietStartup so the spawned instance has credentials but no banner
@@ -77,13 +79,13 @@ export default function (pi: ExtensionAPI) {
       if (initialPrompt) {
         const escaped = initialPrompt.replace(/'/g, "'\\''");
         shellCmd = [
-          `export PATH="${nodeDir}:$PATH"`,
+          `export PATH="${nodeDir}:${cargoDir}:$PATH"`,
           `export PI_CODING_AGENT_DIR="${configDir}"`,
           `${piBin} '${escaped}'`,
         ].join("; ");
       } else {
         shellCmd = [
-          `export PATH="${nodeDir}:$PATH"`,
+          `export PATH="${nodeDir}:${cargoDir}:$PATH"`,
           `export PI_CODING_AGENT_DIR="${configDir}"`,
           piBin,
         ].join("; ");
