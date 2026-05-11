@@ -38,6 +38,18 @@ export default function (pi: ExtensionAPI) {
       const splitArg = pixelHeight > pixelWidth ? "-v" : "-h";
       const direction = pixelHeight > pixelWidth ? "below" : "right";
 
+      // resolve pi's absolute path and its node binary directory.
+      // tmux runs commands via `$SHELL -c`, which is non-interactive
+      // and may not source .bashrc/.zshrc (nvm PATH setup).
+      const whichPi = await pi.exec("which", ["pi"]);
+      const whichNode = await pi.exec("which", ["node"]);
+      if (whichPi.code !== 0 || whichNode.code !== 0) {
+        ctx.ui.notify("pi or node not found on PATH", "error");
+        return;
+      }
+      const piBin = whichPi.stdout.trim();
+      const nodeDir = join(whichNode.stdout.trim(), "..");
+
       // build shell command that pipes the initial prompt to pi
       let shellCmd: string;
       if (initialPrompt) {
@@ -50,9 +62,16 @@ export default function (pi: ExtensionAPI) {
         // pi's stdin open for future commands.
         const tmpFile = join(tmpdir(), `pi-spawn-${Date.now()}.json`);
         writeFileSync(tmpFile, payload + "\n");
-        shellCmd = `cat ${tmpFile} - | pi --mode rpc --no-session; rm -f ${tmpFile}`;
+        shellCmd = [
+          `export PATH="${nodeDir}:$PATH"`,
+          `cat ${tmpFile} - | ${piBin} --mode rpc --no-session`,
+          `rm -f ${tmpFile}`,
+        ].join("; ");
       } else {
-        shellCmd = "pi --mode rpc --no-session";
+        shellCmd = [
+          `export PATH="${nodeDir}:$PATH"`,
+          `${piBin} --mode rpc --no-session`,
+        ].join("; ");
       }
 
       const result = await pi.exec("tmux", [
