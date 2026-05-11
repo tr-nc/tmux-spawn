@@ -27,12 +27,13 @@ async function parseWithLLM(
   if (!input) return { name: pickName(), prompt: "" };
 
   const systemMsg = [
-    "Extract two things from the instruction below:",
+    "Extract and reinterpret the instruction below into two things:",
     "1) name: a short single-word identifier for the agent (3-12 chars)",
-    "2) task: the task description (everything else, verbatim)",
+    "2) task: the task description, rewritten to be clear and concise",
     "",
     "If no name is explicitly given, pick a short memorable single word.",
-    "Return ONLY a JSON object like {\"name\":\"bob\",\"task\":\"build auth\"}.",
+    "Rewrite the task to be clean, direct, and actionable.",
+    "Return ONLY a JSON object like {\"name\":\"bob\",\"task\":\"build auth module\"}.",
     "No markdown, no code fences, no explanation.",
   ].join("\n");
 
