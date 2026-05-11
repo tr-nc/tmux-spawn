@@ -200,6 +200,7 @@ export default function (pi: ExtensionAPI) {
       ]);
 
       ctx.ui.notify(`Spawned "${name}" ${direction}`, "info");
+      if (prompt) ctx.ui.notify(`Task Given: ${prompt}`, "info");
     },
   });
 }
