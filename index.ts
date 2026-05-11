@@ -147,7 +147,19 @@ export default function (pi: ExtensionAPI) {
       // properly escaped for shell single-quote safety
       let shellCmd: string;
       if (prompt) {
-        const escaped = prompt.replace(/'/g, "'\\''");
+        // inject context so the subagent knows where it came from
+        const sessionFile = ctx.sessionManager?.getSessionFile?.() ?? "";
+        const cwd = process.cwd();
+        const contextualized = [
+          "[context from parent]",
+          `parent session: ${sessionFile}`,
+          `cwd: ${cwd}`,
+          `agent name: ${name}`,
+          "",
+          prompt,
+        ].join("\n");
+
+        const escaped = contextualized.replace(/'/g, "'\\''");
         shellCmd = [
           `export PATH="${nodeDir}:${cargoDir}:$PATH"`,
           `export PI_CODING_AGENT_DIR="${configDir}"`,
