@@ -1,3 +1,6 @@
+import { writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
@@ -35,10 +38,27 @@ export default function (pi: ExtensionAPI) {
       const splitArg = pixelHeight > pixelWidth ? "-v" : "-h";
       const direction = pixelHeight > pixelWidth ? "below" : "right";
 
+      // build shell command that pipes the initial prompt to pi
+      let shellCmd: string;
+      if (initialPrompt) {
+        const payload = JSON.stringify({
+          type: "prompt",
+          message: initialPrompt,
+        });
+        // write payload to a temp file, then pipe it to pi via cat.
+        // cat reads the file first, then stdin (the terminal), keeping
+        // pi's stdin open for future commands.
+        const tmpFile = join(tmpdir(), `pi-spawn-${Date.now()}.json`);
+        writeFileSync(tmpFile, payload + "\n");
+        shellCmd = `cat ${tmpFile} - | pi --mode rpc --no-session; rm -f ${tmpFile}`;
+      } else {
+        shellCmd = "pi --mode rpc --no-session";
+      }
+
       const result = await pi.exec("tmux", [
-        "split-window", "-P", "-F", "#{pane_id}",
+        "split-window",
         splitArg,
-        "pi --mode rpc --no-session",
+        shellCmd,
       ]);
 
       if (result.code !== 0) {
@@ -49,22 +69,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const paneId = result.stdout.trim();
       ctx.ui.notify(`New pane spawned ${direction}`, "info");
-
-      if (initialPrompt) {
-        // let pi start up before sending the initial prompt
-        await new Promise((r) => setTimeout(r, 300));
-
-        const payload = JSON.stringify({
-          type: "prompt",
-          message: initialPrompt,
-        });
-        await pi.exec("tmux", [
-          "send-keys", "-l", "-t", paneId,
-          payload, "Enter",
-        ]);
-      }
     },
   });
 }
