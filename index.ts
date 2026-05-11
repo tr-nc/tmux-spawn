@@ -1,5 +1,5 @@
-import { mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -50,11 +50,26 @@ export default function (pi: ExtensionAPI) {
       const piBin = whichPi.stdout.trim();
       const nodeDir = join(whichNode.stdout.trim(), "..");
 
-      // set up a temp pi config directory with quietStartup to hide the banner
+      // copy the user's real pi config (settings + auth) into a temp dir and
+      // add quietStartup so the spawned instance has credentials but no banner
       const configDir = join(tmpdir(), `pi-spawn-config-${Date.now()}`);
       mkdirSync(configDir, { recursive: true });
+
+      const agentDir = join(homedir(), ".pi", "agent");
+      for (const file of ["settings.json", "auth.json"]) {
+        const src = join(agentDir, file);
+        if (existsSync(src)) {
+          copyFileSync(src, join(configDir, file));
+        }
+      }
+
       const settingsFile = join(configDir, "settings.json");
-      writeFileSync(settingsFile, JSON.stringify({ quietStartup: true }) + "\n");
+      let settings: Record<string, unknown> = {};
+      if (existsSync(settingsFile)) {
+        settings = JSON.parse(readFileSync(settingsFile, "utf-8"));
+      }
+      settings.quietStartup = true;
+      writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + "\n");
 
       // build shell command that launches pi interactively with the initial prompt,
       // properly escaped for shell single-quote safety
