@@ -151,13 +151,13 @@ export default function (pi: ExtensionAPI) {
         shellCmd = [
           `export PATH="${nodeDir}:${cargoDir}:$PATH"`,
           `export PI_CODING_AGENT_DIR="${configDir}"`,
-          `${piBin} '${escaped}'`,
+          `${piBin} --model deepseek/deepseek-v4-flash --thinking off '${escaped}'`,
         ].join("; ");
       } else {
         shellCmd = [
           `export PATH="${nodeDir}:${cargoDir}:$PATH"`,
           `export PI_CODING_AGENT_DIR="${configDir}"`,
-          piBin,
+          `${piBin} --model deepseek/deepseek-v4-flash --thinking off`,
         ].join("; ");
       }
 
