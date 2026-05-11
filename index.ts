@@ -3,11 +3,38 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+// short memorable words for auto-generated agent names
+const NAME_POOL = [
+  "nova", "flux", "echo", "volt", "dune", "mode", "beam",
+  "grid", "loop", "spin", "glow", "dash", "vibe", "byte",
+  "node", "peak", "zinc", "luna", "mars", "bolt", "seek",
+  "rift", "surf", "drift", "prism", "shard", "ember", "crest",
+];
+
+function parseName(input: string): { name: string; prompt: string } {
+  if (!input) return { name: pickName(), prompt: "" };
+  const parts = input.split(/\s+/);
+  const first = parts[0]!;
+  // first word is a name if it looks like an identifier
+  if (/^[a-zA-Z0-9_-]{3,16}$/.test(first)) {
+    return { name: first, prompt: parts.slice(1).join(" ") };
+  }
+  return { name: pickName(), prompt: input };
+}
+
+let nameIndex = 0;
+function pickName(): string {
+  const idx = nameIndex++ % NAME_POOL.length;
+  const suffix = Math.floor(nameIndex / NAME_POOL.length);
+  return suffix > 0 ? `${NAME_POOL[idx]}${suffix}` : NAME_POOL[idx]!;
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("spawn", {
-    description: "Spawn a pi session in a tmux pane (below if tall, right if wide)",
+    description: "Spawn a named pi session in a tmux pane (below if tall, right if wide)",
     handler: async (args, ctx) => {
-      const initialPrompt = args as string;
+      const rawInput = (args as string).trim();
+      const { name, prompt } = parseName(rawInput);
 
       // Get current tmux window dimensions in characters and cell pixel sizes
       const dims = await pi.exec("tmux", [
@@ -76,8 +103,8 @@ export default function (pi: ExtensionAPI) {
       // build shell command that launches pi interactively with the initial prompt,
       // properly escaped for shell single-quote safety
       let shellCmd: string;
-      if (initialPrompt) {
-        const escaped = initialPrompt.replace(/'/g, "'\\''");
+      if (prompt) {
+        const escaped = prompt.replace(/'/g, "'\\''");
         shellCmd = [
           `export PATH="${nodeDir}:${cargoDir}:$PATH"`,
           `export PI_CODING_AGENT_DIR="${configDir}"`,
@@ -92,7 +119,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const result = await pi.exec("tmux", [
-        "split-window",
+        "split-window", "-P", "-F", "#{pane_id}",
         splitArg,
         shellCmd,
       ]);
@@ -105,7 +132,14 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      ctx.ui.notify(`New pane spawned ${direction}`, "info");
+      const paneId = result.stdout.trim();
+
+      // set the pane title so the name sticks to the top bar
+      await pi.exec("tmux", [
+        "select-pane", "-t", paneId, "-T", name,
+      ]);
+
+      ctx.ui.notify(`Spawned "${name}" ${direction}`, "info");
     },
   });
 }
