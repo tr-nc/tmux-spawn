@@ -148,8 +148,9 @@ export default function (pi: ExtensionAPI) {
       settings.quietStartup = true;
       writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + "\n");
 
-      // build shell command that launches pi interactively with the initial prompt,
-      // properly escaped for shell single-quote safety
+      // build shell command: pi -p processes the task and exits, then signals
+      // the main agent via tmux wait-for before keeping the pane open
+      const signalId = `pi-spawn-${Date.now()}`;
       let shellCmd: string;
       if (prompt) {
         // inject context so the subagent knows where it came from
@@ -168,7 +169,9 @@ export default function (pi: ExtensionAPI) {
         shellCmd = [
           `export PATH="${nodeDir}:${cargoDir}:$PATH"`,
           `export PI_CODING_AGENT_DIR="${configDir}"`,
-          `${piBin} --model deepseek/deepseek-v4-flash --thinking off '${escaped}'`,
+          `${piBin} -p --model deepseek/deepseek-v4-flash --thinking off '${escaped}'`,
+          `tmux wait-for -U ${signalId}`,
+          `exec \${SHELL:-bash}`,
         ].join("; ");
       } else {
         shellCmd = [
@@ -203,6 +206,12 @@ export default function (pi: ExtensionAPI) {
         ? `Spawned "${name}" ${direction}\nTask Assigned: ${prompt}`
         : `Spawned "${name}" ${direction}`;
       ctx.ui.notify(note, "info");
+
+      // wait for the subagent to finish
+      if (prompt) {
+        await pi.exec("tmux", ["wait-for", signalId]);
+        ctx.ui.notify(`Agent "${name}" finished`, "info");
+      }
     },
   });
 }
