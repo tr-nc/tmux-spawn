@@ -3,24 +3,13 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-// short memorable words for auto-generated agent names
+// fallback word pool for auto-generated names when the LLM is unavailable
 const NAME_POOL = [
   "nova", "flux", "echo", "volt", "dune", "mode", "beam",
   "grid", "loop", "spin", "glow", "dash", "vibe", "byte",
   "node", "peak", "zinc", "luna", "mars", "bolt", "seek",
   "rift", "surf", "drift", "prism", "shard", "ember", "crest",
 ];
-
-function parseName(input: string): { name: string; prompt: string } {
-  if (!input) return { name: pickName(), prompt: "" };
-  const parts = input.split(/\s+/);
-  const first = parts[0]!;
-  // first word is a name if it looks like an identifier
-  if (/^[a-zA-Z0-9_-]{3,16}$/.test(first)) {
-    return { name: first, prompt: parts.slice(1).join(" ") };
-  }
-  return { name: pickName(), prompt: input };
-}
 
 let nameIndex = 0;
 function pickName(): string {
@@ -29,12 +18,78 @@ function pickName(): string {
   return suffix > 0 ? `${NAME_POOL[idx]}${suffix}` : NAME_POOL[idx]!;
 }
 
+// use the LLM to extract agent name + task from natural language
+async function parseWithLLM(
+  input: string,
+  piBin: string,
+  pi: ExtensionAPI,
+): Promise<{ name: string; prompt: string }> {
+  if (!input) return { name: pickName(), prompt: "" };
+
+  const systemMsg = [
+    "Extract two things from the instruction below:",
+    "1) name: a short single-word identifier for the agent (3-12 chars)",
+    "2) task: the task description (everything else, verbatim)",
+    "",
+    "If no name is explicitly given, pick a short memorable single word.",
+    "Return ONLY a JSON object like {\"name\":\"bob\",\"task\":\"build auth\"}.",
+    "No markdown, no code fences, no explanation.",
+  ].join("\n");
+
+  try {
+    const result = await pi.exec(piBin, [
+      "-p", "--no-session",
+      "--no-context-files", "--no-extensions",
+      "--system-prompt", systemMsg,
+      input,
+    ]);
+
+    if (result.code === 0) {
+      const text = result.stdout.trim();
+      const match = text.match(/\{[\s\S]*\}/);
+      if (match) {
+        const parsed = JSON.parse(match[0]);
+        return {
+          name: String(parsed.name || pickName())
+            .replace(/\s+/g, "-").slice(0, 32),
+          prompt: String(parsed.task || parsed.prompt || "").trim(),
+        };
+      }
+    }
+  } catch {
+    // LLM call failed — fall through to simple fallback
+  }
+
+  // fallback: first word as name, rest as prompt
+  const parts = input.split(/\s+/);
+  const first = parts[0]!;
+  return {
+    name: first.length >= 3 ? first : pickName(),
+    prompt: parts.slice(1).join(" "),
+  };
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("spawn", {
     description: "Spawn a named pi session in a tmux pane (below if tall, right if wide)",
     handler: async (args, ctx) => {
       const rawInput = (args as string).trim();
-      const { name, prompt } = parseName(rawInput);
+
+      // resolve pi's absolute path and its node binary directory early
+      // so we can use the LLM for natural-language parsing
+      const whichPi = await pi.exec("which", ["pi"]);
+      const whichNode = await pi.exec("which", ["node"]);
+      if (whichPi.code !== 0 || whichNode.code !== 0) {
+        ctx.ui.notify("pi or node not found on PATH", "error");
+        return;
+      }
+      const piBin = whichPi.stdout.trim();
+      const nodeDir = join(whichNode.stdout.trim(), "..");
+      const cargoDir = join(homedir(), ".cargo", "bin");
+
+      // use the LLM to parse name + task from the user's natural language
+      ctx.ui.notify("Parsing...", "info");
+      const { name, prompt } = await parseWithLLM(rawInput, piBin, pi);
 
       // Get current tmux window dimensions in characters and cell pixel sizes
       const dims = await pi.exec("tmux", [
@@ -64,20 +119,6 @@ export default function (pi: ExtensionAPI) {
       const pixelWidth = width * cellW;
       const splitArg = pixelHeight > pixelWidth ? "-v" : "-h";
       const direction = pixelHeight > pixelWidth ? "below" : "right";
-
-      // resolve pi's absolute path and its node binary directory.
-      // tmux runs commands via `$SHELL -c`, which is non-interactive
-      // and may not source .bashrc/.zshrc (nvm PATH setup).
-      const whichPi = await pi.exec("which", ["pi"]);
-      const whichNode = await pi.exec("which", ["node"]);
-      if (whichPi.code !== 0 || whichNode.code !== 0) {
-        ctx.ui.notify("pi or node not found on PATH", "error");
-        return;
-      }
-      const piBin = whichPi.stdout.trim();
-      const nodeDir = join(whichNode.stdout.trim(), "..");
-      const cargoDir = join(homedir(), ".cargo", "bin");
-
 
       // copy the user's real pi config (settings + auth) into a temp dir and
       // add quietStartup so the spawned instance has credentials but no banner
