@@ -40,6 +40,8 @@ async function parseWithLLM(
     const result = await pi.exec(piBin, [
       "-p", "--no-session",
       "--no-context-files", "--no-extensions",
+      "--model", "deepseek/deepseek-v4-flash",
+      "--thinking", "off",
       "--system-prompt", systemMsg,
       input,
     ]);
