@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("spawn", {
-    description: "Spawn a new tmux pane (below if tall, right if wide)",
+    description: "Spawn a new pi session in a tmux pane (below if tall, right if wide)",
     handler: async (_args, ctx) => {
       // Get current tmux window dimensions in characters and cell pixel sizes
       const dims = await pi.exec("tmux", [
@@ -33,7 +33,7 @@ export default function (pi: ExtensionAPI) {
       const splitArg = pixelHeight > pixelWidth ? "-v" : "-h";
       const direction = pixelHeight > pixelWidth ? "below" : "right";
 
-      const result = await pi.exec("tmux", ["split-window", splitArg]);
+      const result = await pi.exec("tmux", ["split-window", splitArg, "pi"]);
 
       if (result.code === 0) {
         ctx.ui.notify(`New pane spawned ${direction}`, "info");
