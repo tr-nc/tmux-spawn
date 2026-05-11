@@ -181,6 +181,9 @@ export default function (pi: ExtensionAPI) {
         ].join("; ");
       }
 
+      // lock the wait-for channel before spawning
+      if (prompt) await pi.exec("tmux", ["wait-for", "-L", signalId]);
+
       const result = await pi.exec("tmux", [
         "split-window", "-P", "-F", "#{pane_id}",
         splitArg,
