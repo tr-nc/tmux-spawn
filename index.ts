@@ -1,11 +1,11 @@
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("spawn", {
-    description: "Spawn a pi RPC instance in a tmux pane (below if tall, right if wide)",
+    description: "Spawn a pi session in a tmux pane (below if tall, right if wide)",
     handler: async (args, ctx) => {
       const initialPrompt = args as string;
 
@@ -50,27 +50,27 @@ export default function (pi: ExtensionAPI) {
       const piBin = whichPi.stdout.trim();
       const nodeDir = join(whichNode.stdout.trim(), "..");
 
-      // build shell command that pipes the initial prompt to pi
+      // set up a temp pi config directory with quietStartup to hide the banner
+      const configDir = join(tmpdir(), `pi-spawn-config-${Date.now()}`);
+      mkdirSync(configDir, { recursive: true });
+      const settingsFile = join(configDir, "settings.json");
+      writeFileSync(settingsFile, JSON.stringify({ quietStartup: true }) + "\n");
+
+      // build shell command that launches pi interactively with the initial prompt,
+      // properly escaped for shell single-quote safety
       let shellCmd: string;
       if (initialPrompt) {
-        const payload = JSON.stringify({
-          type: "prompt",
-          message: initialPrompt,
-        });
-        // write payload to a temp file, then pipe it to pi via cat.
-        // cat reads the file first, then stdin (the terminal), keeping
-        // pi's stdin open for future commands.
-        const tmpFile = join(tmpdir(), `pi-spawn-${Date.now()}.json`);
-        writeFileSync(tmpFile, payload + "\n");
+        const escaped = initialPrompt.replace(/'/g, "'\\''");
         shellCmd = [
           `export PATH="${nodeDir}:$PATH"`,
-          `cat ${tmpFile} - | ${piBin} --mode rpc --no-session`,
-          `rm -f ${tmpFile}`,
+          `export PI_CODING_AGENT_DIR="${configDir}"`,
+          `${piBin} '${escaped}'`,
         ].join("; ");
       } else {
         shellCmd = [
           `export PATH="${nodeDir}:$PATH"`,
-          `${piBin} --mode rpc --no-session`,
+          `export PI_CODING_AGENT_DIR="${configDir}"`,
+          piBin,
         ].join("; ");
       }
 
