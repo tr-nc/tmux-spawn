@@ -29,10 +29,13 @@ async function parseWithLLM(
   const systemMsg = [
     "Extract and reinterpret the instruction below into two things:",
     "1) name: a short single-word identifier for the agent (3-12 chars)",
-    "2) task: the task description, rewritten to be clear and concise",
+    "2) task: what the subagent should DO, rewritten to be clear and concise",
+    "",
+    "Important: phrases like 'create an agent that X' / 'spawn an agent that X' / 'make an agent that X'",
+    "mean the subagent's job IS X. Strip the meta-layer: translate 'a agent that says hi' -> just 'Say hi'.",
+    "The subagent is already created — its task is the action it performs, not creating anything.",
     "",
     "If no name is explicitly given, pick a short memorable single word.",
-    "Rewrite the task to be clean, direct, and actionable.",
     "Return ONLY a JSON object like {\"name\":\"bob\",\"task\":\"build auth module\"}.",
     "No markdown, no code fences, no explanation.",
   ].join("\n");
