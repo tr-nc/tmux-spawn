@@ -199,8 +199,10 @@ export default function (pi: ExtensionAPI) {
         "select-pane", "-t", paneId, "-T", name,
       ]);
 
-      ctx.ui.notify(`Spawned "${name}" ${direction}`, "info");
-      if (prompt) ctx.ui.notify(`Task Given: ${prompt}`, "info");
+      const note = prompt
+        ? `Spawned "${name}" ${direction}\nTask Given: ${prompt}`
+        : `Spawned "${name}" ${direction}`;
+      ctx.ui.notify(note, "info");
     },
   });
 }
