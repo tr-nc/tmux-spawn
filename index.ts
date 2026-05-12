@@ -899,7 +899,8 @@ export default function (pi: ExtensionAPI) {
     description: "Send a follow-up task to an existing /spawn tmux subagent by name, preserving that subagent's Pi session/context.",
     promptSnippet: "Send a task to an existing named /spawn subagent in its tmux pane",
     promptGuidelines: [
-      "Use tell_spawned_agent when the user asks to tell, ask, or delegate work to a named spawned agent such as bob.",
+      "Use tell_spawned_agent when the user asks to tell, ask, or delegate work to an existing named spawned agent such as bob.",
+      "If the requested agent does not exist, use spawn_agent with that name and task instead.",
       "By default, tasks run in background and notify when complete. Set wait=true only when the current answer must include the result.",
       "Set reportKeys when you want the spawned agent to report structured JSON back to you with keys you choose.",
       "Use list_spawned_agents first if you need to know which spawned agents exist.",
@@ -1001,6 +1002,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use spawn_agent when the user asks in plain text to spawn, hire, create an agent, create a subagent, make an agent, start, launch, or add a named agent/subagent.",
       "For requests like 'spawn bob and ask about his model', set name to 'bob' and task to 'Ask/report what model you are using.'.",
+      "For requests like 'ask bob to get the weather', if bob does not already exist, set name to 'bob' and task to 'Get the weather'.",
       "By default, initial tasks run in background and notify when complete. Set wait=true only when the current answer must include the result.",
       "spawn_agent starts the tmux subagent immediately; /spawn remains available as a manual slash command.",
     ],
@@ -1069,10 +1071,10 @@ export default function (pi: ExtensionAPI) {
       : "";
     completedNotices.length = 0;
     const spawnedContext = spawnedAgents.size > 0
-      ? `\n\nSpawned tmux subagents available for delegation:\n${formatAgents(spawnedAgents)}\nWhen the user says something like "tell bob to ...", call tell_spawned_agent with name "bob" and the requested task. By default, spawned-agent tasks run in background and you will be notified when they finish. Set wait=true only when the current response must include the result. If you need a structured report back from the subagent, set reportKeys to the JSON keys you want in its report. If the user asks to stop/kill/close a spawned agent, call kill_spawned_agent.`
+      ? `\n\nSpawned tmux subagents:\n${formatAgents(spawnedAgents)}`
       : "";
     return {
-      systemPrompt: `${event.systemPrompt}\n\nYou can spawn new tmux subagents with the spawn_agent tool when the user asks in plain text to spawn, hire, create an agent/subagent, make an agent, start, launch, or add an agent. Spawned-agent tasks run in background by default so you stay responsive; set wait=true only if the current answer must include the result. Use wait_for_spawned_agent only when you explicitly need to join a still-running task. You can kill subagents with kill_spawned_agent when the user asks to despawn, kill, fire, nuke, stop, close, terminate, or remove an agent.${spawnedContext}${completedContext}`,
+      systemPrompt: `${event.systemPrompt}${spawnedContext}${completedContext}`,
     };
   });
 
