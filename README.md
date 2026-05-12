@@ -43,7 +43,7 @@ Spawned agents are tracked by name and pane id in the main extension runtime.
 - `/kill-agent bob` kills bob's tmux pane and removes it from tracking. Kill keywords include `despawn`, `kill`, `fire`, `nuke`, `stop`, `close`, `terminate`, and `remove`.
 - Agent names are unique. If a requested name already exists, the new agent gets a similar fallback such as `bob-2`.
 - Natural input like `tell bob to say hi again` is intercepted and sent directly to bob.
-- The main agent also gets spawned-agent context in its system prompt and can use the `list_spawned_agents`, `tell_spawned_agent`, `spawn_agent`, and `kill_spawned_agent` tools when useful.
+- The main agent also gets spawned-agent context in its system prompt and can use the `list_spawned_agents`, `tell_spawned_agent`, `spawn_agent`, `wait_for_spawned_agent`, `collect_spawned_reports`, and `kill_spawned_agent` tools when useful.
 - If the main agent no longer needs a subagent, it can call `kill_spawned_agent` on its own.
 - When the main agent quits normally, all tracked spawned-agent panes are killed as well.
 - Pane layout is stable and serialized: the main agent keeps about 60% of the window, spawned agents share the remaining 40%.
@@ -51,18 +51,27 @@ Spawned agents are tracked by name and pane id in the main extension runtime.
 
 ## Reports back to the main agent
 
-Spawned agents get an injected `report_to_parent` tool. When the main agent uses `tell_spawned_agent`, it can choose `reportKeys` (for example `["status", "summary", "files"]`). The subagent is instructed to call `report_to_parent` with a JSON object using those keys. After the subagent becomes idle, the main agent receives the report in the `tell_spawned_agent` tool result.
+Spawned agents get an injected `report_to_parent` tool. When the main agent uses `spawn_agent` or `tell_spawned_agent`, it can choose `reportKeys` (for example `["status", "summary", "files"]`). The subagent is instructed to call `report_to_parent` with a JSON object using those keys.
+
+By default, `spawn_agent`/`tell_spawned_agent` block when a task is supplied and return the report immediately. For independent work, the main agent can set `wait=false`; the subagent runs in the background, and the main agent can later call `wait_for_spawned_agent` to join or `collect_spawned_reports` to read already-written reports without blocking.
 
 If the subagent does not call `report_to_parent`, the injected extension also tries to parse JSON from the subagent's final assistant message.
 
-## Blocking / completion notification
+## Blocking / background work / completion notification
 
-The parent command blocks only when a task is supplied. It uses tmux `wait-for` lock mode:
+The extension supports both blocking and background delegation:
 
-1. parent locks `pi-spawn-idle-*` before spawning the pane;
-2. subagent runs the initial task;
+- default `wait=true`: parent locks the agent channel, sends/spawns the task, waits for `agent_end`, then returns reports;
+- `wait=false`: parent locks the channel, sends/spawns the task, returns immediately, and records the task as `[running]`;
+- `wait_for_spawned_agent`: joins a recorded background task and returns reports;
+- `collect_spawned_reports`: reads reports that already exist without waiting.
+
+It uses tmux `wait-for` lock mode:
+
+1. parent locks `pi-spawn-idle-*` before spawning/sending a task;
+2. subagent runs the task;
 3. injected extension handles `agent_end` and unlocks/signals the tmux channel;
-4. parent unblocks and shows `Agent "name" finished`.
+4. parent either unblocks immediately (`wait=true`) or can join later (`wait=false`).
 
 Important implementation notes:
 
