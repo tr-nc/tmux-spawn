@@ -447,7 +447,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_shutdown", async (event, ctx) => {
-    if (event.reason === "quit") await killAllAgents(ctx);
+    if (event.reason === "quit" || event.reason === "new") await killAllAgents(ctx);
   });
 
   async function sendToAgent(
