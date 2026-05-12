@@ -487,6 +487,9 @@ export default function (pi: ExtensionAPI) {
     const agent: SpawnedAgent = { name, paneId, signalId, task: prompt, configDir, reportFile, splitArg: layout.splitArg, createdAt: Date.now() };
     spawnedAgents.set(name, agent);
     await pi.exec("tmux", ["select-pane", "-t", paneId, "-T", name]);
+    if (mainPaneId && await paneExists(mainPaneId)) {
+      await pi.exec("tmux", ["select-pane", "-t", mainPaneId]);
+    }
 
     let reports: ParentReport[] = [];
     if (task) {
@@ -950,6 +953,9 @@ export default function (pi: ExtensionAPI) {
       await pi.exec("tmux", [
         "select-pane", "-t", paneId, "-T", name,
       ]);
+      if (mainPaneId && await paneExists(mainPaneId)) {
+        await pi.exec("tmux", ["select-pane", "-t", mainPaneId]);
+      }
 
       const renamed = name !== requestedName ? ` (requested "${requestedName}"; renamed to avoid collision)` : "";
       const note = prompt
