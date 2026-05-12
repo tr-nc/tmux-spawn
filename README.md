@@ -30,7 +30,7 @@ The command/tool path parses the input into an agent name and task, creates a te
 
 ## Spawned-agent name bar
 
-Each spawned Pi receives `PI_SPAWN_AGENT_NAME` and the injected extension draws a one-line top header with `ctx.ui.setHeader()`, e.g. `> bob`. This is rendered by Pi's TUI framework, not by tmux. The tmux pane title is still set to the same name as a fallback.
+Each spawned Pi receives `PI_SPAWN_AGENT_NAME` and the injected extension draws a one-line top header with `ctx.ui.setHeader()`, e.g. `> bob`. It also writes the same label into Pi's status bar with `ctx.ui.setStatus()` so the name remains visible when the pane is scrolled. This is rendered by Pi's TUI framework, not by tmux. The tmux pane title is still set to the same name as a fallback.
 
 The temp config also gets copies of `fd`/`rg` in `bin/` when available so Pi does not print tool-download messages above the name bar on startup.
 

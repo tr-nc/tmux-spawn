@@ -494,6 +494,7 @@ export default function (pi: ExtensionAPI) {
       '  pi.on("session_start", async (_event, ctx) => {',
       "    if (!ctx.hasUI) return;",
       "    ctx.ui.setTitle(`pi - ${agentName}`);",
+      "    ctx.ui.setStatus('spawn-agent-name', ctx.ui.theme.fg('accent', `> ${agentName}`));",
       '    ctx.ui.setHeader((_tui, theme) => ({',
       "      invalidate() {},",
       "      render(_width: number): string[] {",
