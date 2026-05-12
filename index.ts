@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -190,6 +191,7 @@ async function parseWithLLM(
 
 export default function (pi: ExtensionAPI) {
   const spawnedAgents = new Map<string, SpawnedAgent>();
+  const loadedRegistryFiles = new Set<string>();
   let mainPaneId = process.env.TMUX_PANE;
   let spawnQueue: Promise<void> = Promise.resolve();
 
@@ -200,6 +202,67 @@ export default function (pi: ExtensionAPI) {
 
   function oppositeSplitArg(splitArg: "-h" | "-v"): "-h" | "-v" {
     return splitArg === "-h" ? "-v" : "-h";
+  }
+
+  function registryFileFor(ctx?: ExtensionContext): string {
+    const key = ctx?.sessionManager?.getSessionFile?.() || `${ctx?.cwd || process.cwd()}:${mainPaneId || process.env.TMUX_PANE || process.pid}`;
+    const hash = createHash("sha1").update(key).digest("hex").slice(0, 16);
+    return join(tmpdir(), `pi-spawn-registry-${hash}.json`);
+  }
+
+  function isSpawnedAgent(value: unknown): value is SpawnedAgent {
+    const agent = value as Partial<SpawnedAgent>;
+    return typeof agent?.name === "string"
+      && typeof agent.paneId === "string"
+      && typeof agent.signalId === "string"
+      && typeof agent.reportFile === "string"
+      && typeof agent.configDir === "string"
+      && (agent.splitArg === "-h" || agent.splitArg === "-v");
+  }
+
+  function loadRegistry(ctx?: ExtensionContext): void {
+    const file = registryFileFor(ctx);
+    if (loadedRegistryFiles.has(file)) return;
+    loadedRegistryFiles.add(file);
+
+    if (existsSync(file)) {
+      try {
+        const parsed = JSON.parse(readFileSync(file, "utf-8"));
+        const agents = Array.isArray(parsed?.agents) ? parsed.agents : [];
+        for (const agent of agents) {
+          if (isSpawnedAgent(agent) && !spawnedAgents.has(agent.name)) spawnedAgents.set(agent.name, agent);
+        }
+      } catch {
+        // Ignore corrupt/old registry files; session history can still recover agents.
+      }
+    }
+
+    const sessionFile = ctx?.sessionManager?.getSessionFile?.();
+    if (!sessionFile || !existsSync(sessionFile)) return;
+    try {
+      for (const line of readFileSync(sessionFile, "utf-8").split("\n")) {
+        if (!line.trim()) continue;
+        const entry = JSON.parse(line);
+        const message = entry?.message;
+        if (entry?.type !== "message" || message?.role !== "toolResult") continue;
+        const toolName = message.toolName;
+        const agent = message.details?.agent;
+        if (toolName === "spawn_agent" && isSpawnedAgent(agent) && !spawnedAgents.has(agent.name)) {
+          spawnedAgents.set(agent.name, agent);
+        }
+        if (toolName === "kill_spawned_agent" && isSpawnedAgent(agent)) {
+          spawnedAgents.delete(agent.name);
+        }
+      }
+    } catch {
+      // Session recovery is best effort.
+    }
+  }
+
+  function saveRegistry(ctx?: ExtensionContext): void {
+    const file = registryFileFor(ctx);
+    loadedRegistryFiles.add(file);
+    writeFileSync(file, JSON.stringify({ agents: [...spawnedAgents.values()] }, null, 2) + "\n");
   }
 
   async function paneExists(paneId: string): Promise<boolean> {
@@ -247,9 +310,6 @@ export default function (pi: ExtensionAPI) {
         return [{ paneId, name, splitArg, width: parseInt(width || "0", 10), height: parseInt(height || "0", 10) }];
       });
 
-    for (const agent of [...spawnedAgents.values()]) {
-      if (!live.some((pane) => pane.paneId === agent.paneId)) spawnedAgents.delete(agent.name);
-    }
     return live;
   }
 
@@ -258,6 +318,9 @@ export default function (pi: ExtensionAPI) {
     await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_owner", owner]);
     await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_agent_name", agent.name]);
     await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_split_arg", agent.splitArg]);
+    await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_signal_id", agent.signalId]);
+    await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_report_file", agent.reportFile]);
+    await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_config_dir", agent.configDir]);
   }
 
   async function getSpawnLayout(defaultSplitArg: "-h" | "-v"): Promise<{
@@ -279,7 +342,8 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  async function killAgent(name: string): Promise<{ agent: SpawnedAgent; wasRunning: boolean }> {
+  async function killAgent(name: string, ctx?: ExtensionContext): Promise<{ agent: SpawnedAgent; wasRunning: boolean }> {
+    loadRegistry(ctx);
     const agent = findAgent(spawnedAgents, name);
     if (!agent) {
       throw new Error(`Unknown spawned agent "${name}".\n${formatAgents(spawnedAgents)}`);
@@ -294,10 +358,11 @@ export default function (pi: ExtensionAPI) {
 
     await pi.exec("tmux", ["wait-for", "-U", agent.signalId]);
     spawnedAgents.delete(agent.name);
+    saveRegistry(ctx);
     return { agent, wasRunning };
   }
 
-  async function killAllAgents(): Promise<void> {
+  async function killAllAgents(ctx?: ExtensionContext): Promise<void> {
     for (const agent of [...spawnedAgents.values()]) {
       try {
         const pane = await pi.exec("tmux", ["display-message", "-p", "-t", agent.paneId, "#{pane_id}"]);
@@ -309,10 +374,11 @@ export default function (pi: ExtensionAPI) {
         spawnedAgents.delete(agent.name);
       }
     }
+    saveRegistry(ctx);
   }
 
-  pi.on("session_shutdown", async (event) => {
-    if (event.reason === "quit") await killAllAgents();
+  pi.on("session_shutdown", async (event, ctx) => {
+    if (event.reason === "quit") await killAllAgents(ctx);
   });
 
   async function sendToAgent(
@@ -321,6 +387,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     options: { wait?: boolean; reportKeys?: string[]; reportInstructions?: string } = {},
   ): Promise<{ agent: SpawnedAgent; reports: ParentReport[] }> {
+    loadRegistry(ctx);
     const agent = findAgent(spawnedAgents, name);
     if (!agent) {
       throw new Error(`Unknown spawned agent "${name}".\n${formatAgents(spawnedAgents)}`);
@@ -328,8 +395,7 @@ export default function (pi: ExtensionAPI) {
 
     const pane = await pi.exec("tmux", ["display-message", "-p", "-t", agent.paneId, "#{pane_id}"]);
     if (pane.code !== 0) {
-      spawnedAgents.delete(agent.name);
-      throw new Error(`Agent "${agent.name}" pane is gone (${agent.paneId})`);
+      throw new Error(`Agent "${agent.name}" pane is gone (${agent.paneId}); reports can still be read with collect_spawned_reports.`);
     }
 
     const wait = options.wait ?? true;
@@ -363,40 +429,45 @@ export default function (pi: ExtensionAPI) {
       delete agent.pendingTask;
       delete agent.pendingSince;
       delete agent.pendingReportOffset;
+      saveRegistry(ctx);
       return { agent, reports };
     }
 
+    saveRegistry(ctx);
     return { agent, reports: [] };
   }
 
-  async function waitForAgent(name: string): Promise<{ agent: SpawnedAgent; reports: ParentReport[]; wasPending: boolean }> {
+  async function waitForAgent(name: string, ctx?: ExtensionContext): Promise<{ agent: SpawnedAgent; reports: ParentReport[]; wasPending: boolean }> {
+    loadRegistry(ctx);
     const agent = findAgent(spawnedAgents, name);
     if (!agent) {
       throw new Error(`Unknown spawned agent "${name}".\n${formatAgents(spawnedAgents)}`);
     }
 
     const pane = await pi.exec("tmux", ["display-message", "-p", "-t", agent.paneId, "#{pane_id}"]);
-    if (pane.code !== 0) {
-      spawnedAgents.delete(agent.name);
-      throw new Error(`Agent "${agent.name}" pane is gone (${agent.paneId})`);
-    }
-
-    const offset = agent.pendingReportOffset ?? readReports(agent).length;
+    const offset = agent.pendingReportOffset ?? 0;
     const wasPending = agent.pendingTask !== undefined;
-    if (wasPending) {
+    if (wasPending && pane.code === 0) {
       const done = await pi.exec("tmux", ["wait-for", "-L", agent.signalId]);
       await pi.exec("tmux", ["wait-for", "-U", agent.signalId]);
       if (done.code !== 0) throw new Error(`Failed waiting for ${agent.name}: ${done.stderr}`);
     }
 
     const reports = readReports(agent).slice(offset);
+    if (wasPending && pane.code !== 0 && reports.length === 0) {
+      spawnedAgents.delete(agent.name);
+      saveRegistry(ctx);
+      throw new Error(`Agent "${agent.name}" pane is gone (${agent.paneId}) and no report was found.`);
+    }
     delete agent.pendingTask;
     delete agent.pendingSince;
     delete agent.pendingReportOffset;
+    saveRegistry(ctx);
     return { agent, reports, wasPending };
   }
 
-  function collectReports(name?: string): { agents: SpawnedAgent[]; reports: ParentReport[] } {
+  function collectReports(name?: string, ctx?: ExtensionContext): { agents: SpawnedAgent[]; reports: ParentReport[] } {
+    loadRegistry(ctx);
     const agents = name ? [findAgent(spawnedAgents, name)].filter((agent): agent is SpawnedAgent => !!agent) : [...spawnedAgents.values()];
     if (name && agents.length === 0) throw new Error(`Unknown spawned agent "${name}".\n${formatAgents(spawnedAgents)}`);
     return { agents, reports: agents.flatMap((agent) => readReports(agent)) };
@@ -408,6 +479,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     options: { wait?: boolean; reportKeys?: string[]; reportInstructions?: string } = {},
   ): Promise<{ agent: SpawnedAgent; direction: string; reports: ParentReport[]; requestedName: string }> {
+    loadRegistry(ctx);
     return withSpawnLock(async () => {
     const requestedName = name;
     name = uniqueAgentName(spawnedAgents, name);
@@ -598,6 +670,7 @@ export default function (pi: ExtensionAPI) {
       agent.pendingReportOffset = 0;
     }
     spawnedAgents.set(name, agent);
+    saveRegistry(ctx);
     await markSpawnPane(agent);
     await pi.exec("tmux", ["select-pane", "-t", paneId, "-T", name]);
     if (mainPaneId && await paneExists(mainPaneId)) {
@@ -611,6 +684,12 @@ export default function (pi: ExtensionAPI) {
       if (done.code !== 0) throw new Error(`Failed while waiting for agent "${name}": ${done.stderr}`);
       reports = readReports(agent);
     }
+    if (task && wait) {
+      delete agent.pendingTask;
+      delete agent.pendingSince;
+      delete agent.pendingReportOffset;
+    }
+    saveRegistry(ctx);
 
     return { agent, direction, reports, requestedName };
     });
@@ -633,8 +712,8 @@ export default function (pi: ExtensionAPI) {
       required: ["name"],
       additionalProperties: false,
     } as any,
-    async execute(_toolCallId, params) {
-      const { agent, wasRunning } = await killAgent(params.name);
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const { agent, wasRunning } = await killAgent(params.name, ctx);
       return {
         content: [{ type: "text", text: `${wasRunning ? "Killed" : "Removed stale"} spawned agent ${agent.name}.` }],
         details: { agent, wasRunning },
@@ -708,8 +787,8 @@ export default function (pi: ExtensionAPI) {
       required: ["name"],
       additionalProperties: false,
     } as any,
-    async execute(_toolCallId, params) {
-      const { agent, reports, wasPending } = await waitForAgent(params.name);
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const { agent, reports, wasPending } = await waitForAgent(params.name, ctx);
       return {
         content: [{ type: "text", text: `${wasPending ? `Waited for ${agent.name}.` : `${agent.name} did not have a tracked background task.`}\n\nReport:\n${formatReports(reports)}` }],
         details: { agent, reports, wasPending },
@@ -733,8 +812,8 @@ export default function (pi: ExtensionAPI) {
       },
       additionalProperties: false,
     } as any,
-    async execute(_toolCallId, params) {
-      const { agents, reports } = collectReports(typeof params.name === "string" && params.name.trim() ? params.name.trim() : undefined);
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const { agents, reports } = collectReports(typeof params.name === "string" && params.name.trim() ? params.name.trim() : undefined, ctx);
       return {
         content: [{ type: "text", text: `Reports from ${agents.map((agent) => agent.name).join(", ") || "no agents"}:\n${formatReports(reports)}` }],
         details: { agents, reports },
@@ -803,7 +882,8 @@ export default function (pi: ExtensionAPI) {
       properties: {},
       additionalProperties: false,
     } as any,
-    async execute() {
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      loadRegistry(ctx);
       return {
         content: [{ type: "text", text: formatAgents(spawnedAgents) }],
         details: { agents: [...spawnedAgents.values()] },
@@ -821,10 +901,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("input", async (event, ctx) => {
+    loadRegistry(ctx);
     const killMatch = event.text.match(/^\s*(?:despawn|kill|fire|nuke|stop|close|terminate|remove)\s+(?:an?\s+)?(?:agent\s+|subagent\s+)?([A-Za-z0-9_.-]+)\s*$/i);
     if (killMatch && findAgent(spawnedAgents, killMatch[1]!)) {
       try {
-        const { agent, wasRunning } = await killAgent(killMatch[1]!);
+        const { agent, wasRunning } = await killAgent(killMatch[1]!, ctx);
         ctx.ui.notify(`${wasRunning ? "Killed" : "Removed stale"} agent "${agent.name}"`, "info");
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
@@ -852,6 +933,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("agents", {
     description: "List spawned tmux agents",
     handler: async (_args, ctx) => {
+      loadRegistry(ctx);
       ctx.ui.notify(formatAgents(spawnedAgents), "info");
     },
   });
@@ -865,7 +947,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       try {
-        const { agent, wasRunning } = await killAgent(name);
+        const { agent, wasRunning } = await killAgent(name, ctx);
         ctx.ui.notify(`${wasRunning ? "Killed" : "Removed stale"} agent "${agent.name}"`, "info");
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
@@ -894,6 +976,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("spawn", {
     description: "Spawn a named pi session in a tmux pane (below if tall, right if wide)",
     handler: async (args, ctx) => {
+      loadRegistry(ctx);
       const rawInput = (args as string).trim();
 
       // resolve pi's absolute path and its node binary directory early
@@ -1140,6 +1223,7 @@ export default function (pi: ExtensionAPI) {
         createdAt: Date.now(),
       };
       spawnedAgents.set(name, agent);
+      saveRegistry(ctx);
       await markSpawnPane(agent);
 
       // set the pane title so the name sticks to the top bar
@@ -1161,6 +1245,7 @@ export default function (pi: ExtensionAPI) {
         const wait = await pi.exec("tmux", ["wait-for", "-L", signalId]);
         await pi.exec("tmux", ["wait-for", "-U", signalId]);
         if (wait.code === 0) {
+          saveRegistry(ctx);
           ctx.ui.notify(`Agent "${name}" finished`, "info");
         } else {
           ctx.ui.notify(`Failed while waiting for agent "${name}": ${wait.stderr}`, "error");

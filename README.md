@@ -36,7 +36,7 @@ The temp config also gets copies of `fd`/`rg` in `bin/` when available so Pi doe
 
 ## Continuing spawned agents
 
-Spawned agents are tracked by name and pane id in the main extension runtime.
+Spawned agents are tracked by name and pane id in the main extension runtime, persisted to a per-session registry, and recoverable from the parent session history after extension reload/compaction.
 
 - `/agents` lists known spawned agents.
 - `/tell bob to say hi` sends a follow-up prompt to bob's existing Pi pane/session.
@@ -63,7 +63,7 @@ The extension supports both blocking and background delegation:
 
 - default `wait=true`: parent locks the agent channel, sends/spawns the task, waits for `agent_end`, then returns reports;
 - `wait=false`: parent locks the channel, sends/spawns the task, returns immediately, and records the task as `[running]`;
-- `wait_for_spawned_agent`: joins a recorded background task and returns reports;
+- `wait_for_spawned_agent`: joins a recorded background task and returns reports, including recovered reports if the subagent pane already exited;
 - `collect_spawned_reports`: reads reports that already exist without waiting.
 
 It uses tmux `wait-for` lock mode:
