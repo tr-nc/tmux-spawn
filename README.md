@@ -30,12 +30,12 @@ The command/tool path parses the input into an agent name and task, creates a te
 
 ## Model tiers
 
-New subagents choose one immutable model at spawn time. The main agent can set `modelTier` on `spawn_agent`:
+New subagents choose one immutable model at spawn time. `spawn_agent` requires an explicit `modelTier`:
 
-- `fast` (default): `deepseek/deepseek-v4-flash`
-- `strong` (default): `gpt5.5`
+- `fast`: defaults to `deepseek/deepseek-v4-flash`
+- `strong`: defaults to `gpt5.5`
 
-The main agent should choose `fast` for simple or latency-sensitive tasks and `strong` for complex reasoning/coding/research, unless the user explicitly asks for fast or strong.
+The main agent must ask the user which tier to use when the user did not explicitly specify fast or strong. Slash `/spawn` also prompts for the tier unless the input already mentions one.
 
 Configure model IDs in `~/.pi/agent/settings.json` or `.pi/settings.json`:
 
