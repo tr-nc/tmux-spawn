@@ -194,6 +194,7 @@ export default function (pi: ExtensionAPI) {
   const loadedRegistryFiles = new Set<string>();
   let mainPaneId = process.env.TMUX_PANE;
   let spawnQueue: Promise<void> = Promise.resolve();
+  let spawnSequence = 0;
 
   // Future reference: focus/click auto-resize was prototyped with a tmux
   // after-select-pane hook and a generated resize script. Disabled for now
@@ -202,6 +203,11 @@ export default function (pi: ExtensionAPI) {
 
   function oppositeSplitArg(splitArg: "-h" | "-v"): "-h" | "-v" {
     return splitArg === "-h" ? "-v" : "-h";
+  }
+
+  function nextSpawnCreatedAt(): number {
+    spawnSequence = (spawnSequence + 1) % 1000;
+    return Date.now() * 1000 + spawnSequence;
   }
 
   function registryFileFor(ctx?: ExtensionContext): string {
@@ -282,6 +288,9 @@ export default function (pi: ExtensionAPI) {
     splitArg: "-h" | "-v";
     width: number;
     height: number;
+    left: number;
+    top: number;
+    createdAt?: number;
   };
 
   async function resolveMainPaneId(): Promise<string> {
@@ -297,7 +306,7 @@ export default function (pi: ExtensionAPI) {
     const listed = await pi.exec("tmux", [
       "list-panes",
       "-F",
-      "#{pane_id}\t#{@pi_spawn_owner}\t#{@pi_spawn_agent_name}\t#{@pi_spawn_split_arg}\t#{pane_width}\t#{pane_height}",
+      "#{pane_id}\t#{@pi_spawn_owner}\t#{@pi_spawn_agent_name}\t#{@pi_spawn_split_arg}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_top}\t#{@pi_spawn_created_at}",
     ]);
     if (listed.code !== 0) return [];
 
@@ -305,9 +314,21 @@ export default function (pi: ExtensionAPI) {
       .split("\n")
       .filter((line) => line.trim())
       .flatMap((line): LiveSpawnPane[] => {
-        const [paneId, paneOwner, name, splitArg, width, height] = line.split("\t");
+        const [paneId, paneOwner, name, splitArg, width, height, left, top, createdAtRaw] = line.split("\t");
         if (paneOwner !== owner || !paneId || !name || (splitArg !== "-h" && splitArg !== "-v")) return [];
-        return [{ paneId, name, splitArg, width: parseInt(width || "0", 10), height: parseInt(height || "0", 10) }];
+        const registryCreatedAt = findAgent(spawnedAgents, name)?.createdAt;
+        const optionCreatedAt = parseInt(createdAtRaw || "", 10);
+        const createdAt = Number.isFinite(optionCreatedAt) ? optionCreatedAt : registryCreatedAt;
+        return [{
+          paneId,
+          name,
+          splitArg,
+          width: parseInt(width || "0", 10),
+          height: parseInt(height || "0", 10),
+          left: parseInt(left || "0", 10),
+          top: parseInt(top || "0", 10),
+          createdAt,
+        }];
       });
 
     return live;
@@ -321,6 +342,11 @@ export default function (pi: ExtensionAPI) {
     await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_signal_id", agent.signalId]);
     await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_report_file", agent.reportFile]);
     await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_config_dir", agent.configDir]);
+    await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_created_at", String(agent.createdAt)]);
+  }
+
+  function sortLivePanesByCreation(panes: LiveSpawnPane[]): LiveSpawnPane[] {
+    return [...panes].sort((a, b) => (a.createdAt ?? Number.MAX_SAFE_INTEGER) - (b.createdAt ?? Number.MAX_SAFE_INTEGER));
   }
 
   async function getSpawnLayout(defaultSplitArg: "-h" | "-v"): Promise<{
@@ -334,12 +360,32 @@ export default function (pi: ExtensionAPI) {
       return { targetPaneId: await resolveMainPaneId(), splitArg: defaultSplitArg, percent: "40" };
     }
 
-    const target = livePanes.sort((a, b) => (b.width * b.height) - (a.width * a.height))[0]!;
+    const first = sortLivePanesByCreation(livePanes)[0]!;
+    const target = [...livePanes].sort((a, b) => (b.width * b.height) - (a.width * a.height))[0]!;
     return {
       targetPaneId: target.paneId,
-      splitArg: oppositeSplitArg(target.splitArg),
+      splitArg: oppositeSplitArg(first.splitArg),
       percent: "50",
     };
+  }
+
+  async function normalizeSpawnPaneSizes(): Promise<void> {
+    const livePanes = await listLiveSpawnPanes();
+    if (livePanes.length <= 1) return;
+
+    const first = sortLivePanesByCreation(livePanes)[0]!;
+    const splitArg = oppositeSplitArg(first.splitArg);
+    const sorted = [...livePanes].sort((a, b) => splitArg === "-h" ? a.left - b.left : a.top - b.top);
+    const total = sorted.reduce((sum, pane) => sum + (splitArg === "-h" ? pane.width : pane.height), 0);
+    if (total <= 0) return;
+
+    const base = Math.floor(total / sorted.length);
+    const remainder = total % sorted.length;
+    const sizeFlag = splitArg === "-h" ? "-x" : "-y";
+    for (let i = 0; i < sorted.length; i++) {
+      const size = base + (i < remainder ? 1 : 0);
+      await pi.exec("tmux", ["resize-pane", "-t", sorted[i]!.paneId, sizeFlag, String(size)]);
+    }
   }
 
   async function killAgent(name: string, ctx?: ExtensionContext): Promise<{ agent: SpawnedAgent; wasRunning: boolean }> {
@@ -480,7 +526,7 @@ export default function (pi: ExtensionAPI) {
     options: { wait?: boolean; reportKeys?: string[]; reportInstructions?: string } = {},
   ): Promise<{ agent: SpawnedAgent; direction: string; reports: ParentReport[]; requestedName: string }> {
     loadRegistry(ctx);
-    return withSpawnLock(async () => {
+    const spawned = await withSpawnLock(async () => {
     const requestedName = name;
     name = uniqueAgentName(spawnedAgents, name);
 
@@ -511,7 +557,6 @@ export default function (pi: ExtensionAPI) {
     const pixelHeight = height * cellH;
     const pixelWidth = width * cellW;
     const splitArg = pixelHeight > pixelWidth ? "-v" : "-h";
-    const direction = pixelHeight > pixelWidth ? "below" : "right";
 
     const configDir = join(tmpdir(), `pi-spawn-config-${Date.now()}`);
     mkdirSync(configDir, { recursive: true });
@@ -566,6 +611,45 @@ export default function (pi: ExtensionAPI) {
       '  pi.on("session_start", async (_event, ctx) => {',
       "    if (!ctx.hasUI) return;",
       "    ctx.ui.setTitle(`pi - ${agentName}`);",
+      "    let paneActive = true;",
+      "    let paneTui: { requestRender(force?: boolean): void } | undefined;",
+      "    let refreshInFlight = false;",
+      "    const readPaneActive = async (): Promise<boolean> => {",
+      "      const pane = process.env.TMUX_PANE;",
+      "      if (!pane) return true;",
+      "      const result = await pi.exec('tmux', ['display-message', '-p', '-t', pane, '#{pane_active}']);",
+      "      return result.code !== 0 ? true : result.stdout.trim() === '1';",
+      "    };",
+      "    const stripInactiveCursor = (line: string): string => line",
+      "      .replace(/\\x1b_pi:c\\x07/g, '')",
+      "      .replace(/\\x1b\\[7m([^\\x1b]*)\\x1b\\[0m/g, '$1');",
+      "    const { CustomEditor } = await import('@earendil-works/pi-coding-agent');",
+      "    class PaneAwareEditor extends CustomEditor {",
+      "      render(width: number): string[] {",
+      "        const lines = super.render(width);",
+      "        return paneActive ? lines : lines.map(stripInactiveCursor);",
+      "      }",
+      "    }",
+      "    ctx.ui.setEditorComponent((tui, theme, keybindings) => {",
+      "      paneTui = tui;",
+      "      return new PaneAwareEditor(tui, theme, keybindings);",
+      "    });",
+      "    const refreshPaneFocus = async () => {",
+      "      if (refreshInFlight) return;",
+      "      refreshInFlight = true;",
+      "      try {",
+      "        const nextPaneActive = await readPaneActive();",
+      "        if (nextPaneActive !== paneActive) {",
+      "          paneActive = nextPaneActive;",
+      "          paneTui?.requestRender(true);",
+      "        }",
+      "      } finally {",
+      "        refreshInFlight = false;",
+      "      }",
+      "    };",
+      "    await refreshPaneFocus();",
+      "    const paneFocusInterval = setInterval(refreshPaneFocus, 500);",
+      "    pi.on('session_shutdown', () => clearInterval(paneFocusInterval));",
       "    ctx.ui.setStatus('spawn-agent-name', ctx.ui.theme.fg('accent', `> ${agentName}`));",
       '    ctx.ui.setHeader((_tui, theme) => ({',
       "      invalidate() {},",
@@ -652,6 +736,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     const layout = await getSpawnLayout(splitArg);
+    const direction = layout.splitArg === "-v" ? "below" : "right";
     const result = await pi.exec("tmux", [
       "split-window", "-t", layout.targetPaneId, "-P", "-F", "#{pane_id}",
       layout.splitArg, "-p", layout.percent,
@@ -663,7 +748,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     const paneId = result.stdout.trim();
-    const agent: SpawnedAgent = { name, paneId, signalId, task: prompt, configDir, reportFile, splitArg: layout.splitArg, createdAt: Date.now() };
+    const agent: SpawnedAgent = { name, paneId, signalId, task: prompt, configDir, reportFile, splitArg: layout.splitArg, createdAt: nextSpawnCreatedAt() };
     if (task && !wait) {
       agent.pendingTask = prompt;
       agent.pendingSince = Date.now();
@@ -672,27 +757,31 @@ export default function (pi: ExtensionAPI) {
     spawnedAgents.set(name, agent);
     saveRegistry(ctx);
     await markSpawnPane(agent);
+    await normalizeSpawnPaneSizes();
     await pi.exec("tmux", ["select-pane", "-t", paneId, "-T", name]);
     if (mainPaneId && await paneExists(mainPaneId)) {
       await pi.exec("tmux", ["select-pane", "-t", mainPaneId]);
     }
 
+    saveRegistry(ctx);
+
+    return { agent, direction, requestedName, task, wait };
+    });
+
+    const { agent, direction, requestedName, task, wait } = spawned;
     let reports: ParentReport[] = [];
     if (task && wait) {
-      const done = await pi.exec("tmux", ["wait-for", "-L", signalId]);
-      await pi.exec("tmux", ["wait-for", "-U", signalId]);
-      if (done.code !== 0) throw new Error(`Failed while waiting for agent "${name}": ${done.stderr}`);
+      const done = await pi.exec("tmux", ["wait-for", "-L", agent.signalId]);
+      await pi.exec("tmux", ["wait-for", "-U", agent.signalId]);
+      if (done.code !== 0) throw new Error(`Failed while waiting for agent "${agent.name}": ${done.stderr}`);
       reports = readReports(agent);
-    }
-    if (task && wait) {
       delete agent.pendingTask;
       delete agent.pendingSince;
       delete agent.pendingReportOffset;
+      saveRegistry(ctx);
     }
-    saveRegistry(ctx);
 
     return { agent, direction, reports, requestedName };
-    });
   }
 
   pi.registerTool({
@@ -994,6 +1083,7 @@ export default function (pi: ExtensionAPI) {
       // use the LLM to parse name + task from the user's natural language
       ctx.ui.notify("Parsing...", "info");
       const parsed = await parseWithLLM(rawInput, piBin, pi);
+      const spawned = await withSpawnLock(async () => {
       const requestedName = parsed.name;
       const name = uniqueAgentName(spawnedAgents, requestedName);
       const prompt = parsed.prompt;
@@ -1025,7 +1115,6 @@ export default function (pi: ExtensionAPI) {
       const pixelHeight = height * cellH;
       const pixelWidth = width * cellW;
       const splitArg = pixelHeight > pixelWidth ? "-v" : "-h";
-      const direction = pixelHeight > pixelWidth ? "below" : "right";
 
       // copy the user's real pi config (settings + auth) into a temp dir and
       // add quietStartup so the spawned instance has credentials but no banner
@@ -1089,6 +1178,45 @@ export default function (pi: ExtensionAPI) {
         '  pi.on("session_start", async (_event, ctx) => {',
         "    if (!ctx.hasUI) return;",
         "    ctx.ui.setTitle(`pi - ${agentName}`);",
+        "    let paneActive = true;",
+        "    let paneTui: { requestRender(force?: boolean): void } | undefined;",
+        "    let refreshInFlight = false;",
+        "    const readPaneActive = async (): Promise<boolean> => {",
+        "      const pane = process.env.TMUX_PANE;",
+        "      if (!pane) return true;",
+        "      const result = await pi.exec('tmux', ['display-message', '-p', '-t', pane, '#{pane_active}']);",
+        "      return result.code !== 0 ? true : result.stdout.trim() === '1';",
+        "    };",
+        "    const stripInactiveCursor = (line: string): string => line",
+        "      .replace(/\\x1b_pi:c\\x07/g, '')",
+        "      .replace(/\\x1b\\[7m([^\\x1b]*)\\x1b\\[0m/g, '$1');",
+        "    const { CustomEditor } = await import('@earendil-works/pi-coding-agent');",
+        "    class PaneAwareEditor extends CustomEditor {",
+        "      render(width: number): string[] {",
+        "        const lines = super.render(width);",
+        "        return paneActive ? lines : lines.map(stripInactiveCursor);",
+        "      }",
+        "    }",
+        "    ctx.ui.setEditorComponent((tui, theme, keybindings) => {",
+        "      paneTui = tui;",
+        "      return new PaneAwareEditor(tui, theme, keybindings);",
+        "    });",
+        "    const refreshPaneFocus = async () => {",
+        "      if (refreshInFlight) return;",
+        "      refreshInFlight = true;",
+        "      try {",
+        "        const nextPaneActive = await readPaneActive();",
+        "        if (nextPaneActive !== paneActive) {",
+        "          paneActive = nextPaneActive;",
+        "          paneTui?.requestRender(true);",
+        "        }",
+        "      } finally {",
+        "        refreshInFlight = false;",
+        "      }",
+        "    };",
+        "    await refreshPaneFocus();",
+        "    const paneFocusInterval = setInterval(refreshPaneFocus, 500);",
+        "    pi.on('session_shutdown', () => clearInterval(paneFocusInterval));",
         '    ctx.ui.setHeader((_tui, theme) => ({',
         "      invalidate() {},",
         "      render(_width: number): string[] {",
@@ -1196,6 +1324,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const layout = await getSpawnLayout(splitArg);
+      const direction = layout.splitArg === "-v" ? "below" : "right";
       const result = await pi.exec("tmux", [
         "split-window", "-t", layout.targetPaneId, "-P", "-F", "#{pane_id}",
         layout.splitArg, "-p", layout.percent,
@@ -1220,11 +1349,12 @@ export default function (pi: ExtensionAPI) {
         configDir,
         reportFile,
         splitArg: layout.splitArg,
-        createdAt: Date.now(),
+        createdAt: nextSpawnCreatedAt(),
       };
       spawnedAgents.set(name, agent);
       saveRegistry(ctx);
       await markSpawnPane(agent);
+      await normalizeSpawnPaneSizes();
 
       // set the pane title so the name sticks to the top bar
       await pi.exec("tmux", [
@@ -1239,16 +1369,19 @@ export default function (pi: ExtensionAPI) {
         ? `Spawned "${name}" ${direction}${renamed}\nTask Assigned: ${prompt}`
         : `Spawned "${name}" ${direction}${renamed}`;
       ctx.ui.notify(note, "info");
+      return { prompt, signalId, name };
+      });
+      if (!spawned) return;
 
       // wait for the subagent to finish its initial task
-      if (prompt) {
-        const wait = await pi.exec("tmux", ["wait-for", "-L", signalId]);
-        await pi.exec("tmux", ["wait-for", "-U", signalId]);
+      if (spawned.prompt) {
+        const wait = await pi.exec("tmux", ["wait-for", "-L", spawned.signalId]);
+        await pi.exec("tmux", ["wait-for", "-U", spawned.signalId]);
         if (wait.code === 0) {
           saveRegistry(ctx);
-          ctx.ui.notify(`Agent "${name}" finished`, "info");
+          ctx.ui.notify(`Agent "${spawned.name}" finished`, "info");
         } else {
-          ctx.ui.notify(`Failed while waiting for agent "${name}": ${wait.stderr}`, "error");
+          ctx.ui.notify(`Failed while waiting for agent "${spawned.name}": ${wait.stderr}`, "error");
         }
       }
     },
