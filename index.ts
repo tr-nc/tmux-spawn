@@ -572,7 +572,7 @@ export default function (pi: ExtensionAPI) {
     description: "Terminate a named /spawn tmux subagent and remove it from the known spawned-agent list.",
     promptSnippet: "Kill a named /spawn tmux subagent pane",
     promptGuidelines: [
-      "Use kill_spawned_agent when the user asks to kill, stop, close, terminate, or remove a named spawned agent.",
+      "Use kill_spawned_agent when the user asks to despawn, kill, fire, nuke, stop, close, terminate, or remove a named spawned agent.",
       "Use list_spawned_agents first if you need to know which spawned agents exist.",
     ],
     parameters: {
@@ -639,7 +639,7 @@ export default function (pi: ExtensionAPI) {
     description: "Spawn a new named Pi subagent in a tmux pane. This is the tool equivalent of /spawn and preserves the /spawn command behavior.",
     promptSnippet: "Spawn a named Pi subagent in a tmux pane for delegated work",
     promptGuidelines: [
-      "Use spawn_agent when the user asks in plain text to spawn, create, or start a named agent/subagent.",
+      "Use spawn_agent when the user asks in plain text to spawn, hire, create an agent, create a subagent, make an agent, start, launch, or add a named agent/subagent.",
       "For requests like 'spawn bob and ask about his model', set name to 'bob' and task to 'Ask/report what model you are using.'.",
       "spawn_agent starts the tmux subagent immediately; /spawn remains available as a manual slash command.",
     ],
@@ -700,11 +700,22 @@ export default function (pi: ExtensionAPI) {
       ? `\n\nSpawned tmux subagents available for delegation:\n${formatAgents(spawnedAgents)}\nWhen the user says something like "tell bob to ...", call tell_spawned_agent with name "bob" and the requested task. If you need a structured report back from the subagent, set reportKeys to the JSON keys you want in its report. If the user asks to stop/kill/close a spawned agent, call kill_spawned_agent.`
       : "";
     return {
-      systemPrompt: `${event.systemPrompt}\n\nYou can spawn new tmux subagents with the spawn_agent tool when the user asks in plain text to spawn/create/start an agent. You can kill them with kill_spawned_agent.${spawnedContext}`,
+      systemPrompt: `${event.systemPrompt}\n\nYou can spawn new tmux subagents with the spawn_agent tool when the user asks in plain text to spawn, hire, create an agent/subagent, make an agent, start, launch, or add an agent. You can kill subagents with kill_spawned_agent when the user asks to despawn, kill, fire, nuke, stop, close, terminate, or remove an agent.${spawnedContext}`,
     };
   });
 
   pi.on("input", async (event, ctx) => {
+    const killMatch = event.text.match(/^\s*(?:despawn|kill|fire|nuke|stop|close|terminate|remove)\s+(?:an?\s+)?(?:agent\s+|subagent\s+)?([A-Za-z0-9_.-]+)\s*$/i);
+    if (killMatch && findAgent(spawnedAgents, killMatch[1]!)) {
+      try {
+        const { agent, wasRunning } = await killAgent(killMatch[1]!);
+        ctx.ui.notify(`${wasRunning ? "Killed" : "Removed stale"} agent "${agent.name}"`, "info");
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
+      return { action: "handled" };
+    }
+
     const match = event.text.match(/^\s*(?:tell|ask)\s+([A-Za-z0-9_.-]+)\s+to\s+([\s\S]+)$/i);
     if (!match || !findAgent(spawnedAgents, match[1]!)) return { action: "continue" };
 

@@ -17,10 +17,12 @@ Slash command usage is still supported:
 /spawn
 ```
 
-Plain text delegation is also supported through the main agent's `spawn_agent` tool:
+Plain text delegation is also supported through the main agent's `spawn_agent` tool. Spawn keywords include `spawn`, `hire`, `create an agent`, `make an agent`, `start`, `launch`, and `add`:
 
 ```text
 spawn a agent named bob
+hire bob to review the diff
+create an agent named alice
 spawn bob and ask about his model
 ```
 
@@ -38,7 +40,7 @@ Spawned agents are tracked by name and pane id in the main extension runtime.
 
 - `/agents` lists known spawned agents.
 - `/tell bob to say hi` sends a follow-up prompt to bob's existing Pi pane/session.
-- `/kill-agent bob` kills bob's tmux pane and removes it from tracking.
+- `/kill-agent bob` kills bob's tmux pane and removes it from tracking. Kill keywords include `despawn`, `kill`, `fire`, `nuke`, `stop`, `close`, `terminate`, and `remove`.
 - Agent names are unique. If a requested name already exists, the new agent gets a similar fallback such as `bob-2`.
 - Natural input like `tell bob to say hi again` is intercepted and sent directly to bob.
 - The main agent also gets spawned-agent context in its system prompt and can use the `list_spawned_agents`, `tell_spawned_agent`, `spawn_agent`, and `kill_spawned_agent` tools when useful.
