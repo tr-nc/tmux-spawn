@@ -53,7 +53,7 @@ Spawned agents are tracked by name and pane id in the main extension runtime, pe
 
 Spawned agents get an injected `report_to_parent` tool. When the main agent uses `spawn_agent` or `tell_spawned_agent`, it can choose `reportKeys` (for example `["status", "summary", "files"]`). The subagent is instructed to call `report_to_parent` with a JSON object using those keys.
 
-By default, `spawn_agent`/`tell_spawned_agent` block when a task is supplied and return the report immediately. For independent work, the main agent can set `wait=false`; the subagent runs in the background, and the main agent can later call `wait_for_spawned_agent` to join or `collect_spawned_reports` to read already-written reports without blocking.
+By default, `spawn_agent`/`tell_spawned_agent` return immediately when a task is supplied. The subagent runs in the background; when it finishes, the extension notifies the main UI and sends a synthetic completion message to the main agent so it parses the report and replies to the user. The completed report is also injected into the main agent's next turn. If the current answer truly depends on the result, set `wait=true` to block until completion. The main agent can also call `wait_for_spawned_agent` to join a still-running task or `collect_spawned_reports` to read already-written reports without blocking.
 
 If the subagent does not call `report_to_parent`, the injected extension also tries to parse JSON from the subagent's final assistant message.
 
@@ -61,8 +61,8 @@ If the subagent does not call `report_to_parent`, the injected extension also tr
 
 The extension supports both blocking and background delegation:
 
-- default `wait=true`: parent locks the agent channel, sends/spawns the task, waits for `agent_end`, then returns reports;
-- `wait=false`: parent locks the channel, sends/spawns the task, returns immediately, and records the task as `[running]`;
+- default `wait=false`: parent locks the channel, sends/spawns the task, returns immediately, records the task as `[running]`, and starts a background waiter that notifies on completion and asks the main agent to parse/reply with the result;
+- `wait=true`: parent locks the agent channel, sends/spawns the task, waits for `agent_end`, then returns reports;
 - `wait_for_spawned_agent`: joins a recorded background task and returns reports, including recovered reports if the subagent pane already exited;
 - `collect_spawned_reports`: reads reports that already exist without waiting.
 

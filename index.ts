@@ -33,6 +33,14 @@ type ParentReport = {
   json?: unknown;
 };
 
+type CompletedAgentNotice = {
+  agentName: string;
+  task: string;
+  completedAt: number;
+  reports: ParentReport[];
+  error?: string;
+};
+
 type SpawnedAgent = {
   name: string;
   paneId: string;
@@ -115,6 +123,19 @@ function formatReports(reports: ParentReport[]): string {
     .join("\n\n");
 }
 
+function formatCompletedNotices(notices: CompletedAgentNotice[]): string {
+  if (notices.length === 0) return "";
+  return notices
+    .map((notice) => {
+      const status = notice.error ? `failed: ${notice.error}` : "finished";
+      return [
+        `- ${notice.agentName} ${status}${notice.task ? `: ${notice.task}` : ""}`,
+        notice.reports.length > 0 ? formatReports(notice.reports) : undefined,
+      ].filter((line): line is string => !!line).join("\n");
+    })
+    .join("\n\n");
+}
+
 function withReportRequest(task: string, reportKeys?: string[], reportInstructions?: string): string {
   if (!reportKeys?.length && !reportInstructions?.trim()) return task;
   const lines = [
@@ -192,6 +213,7 @@ async function parseWithLLM(
 export default function (pi: ExtensionAPI) {
   const spawnedAgents = new Map<string, SpawnedAgent>();
   const loadedRegistryFiles = new Set<string>();
+  const completedNotices: CompletedAgentNotice[] = [];
   let mainPaneId = process.env.TMUX_PANE;
   let spawnQueue: Promise<void> = Promise.resolve();
   let spawnSequence = 0;
@@ -404,6 +426,7 @@ export default function (pi: ExtensionAPI) {
 
     await pi.exec("tmux", ["wait-for", "-U", agent.signalId]);
     spawnedAgents.delete(agent.name);
+    await normalizeSpawnPaneSizes();
     saveRegistry(ctx);
     return { agent, wasRunning };
   }
@@ -439,12 +462,16 @@ export default function (pi: ExtensionAPI) {
       throw new Error(`Unknown spawned agent "${name}".\n${formatAgents(spawnedAgents)}`);
     }
 
+    const wait = options.wait ?? false;
+    if (agent.pendingTask && !wait) {
+      throw new Error(`Agent "${agent.name}" is already running: ${agent.pendingTask}. Use wait_for_spawned_agent or collect_spawned_reports before sending another task.`);
+    }
+
     const pane = await pi.exec("tmux", ["display-message", "-p", "-t", agent.paneId, "#{pane_id}"]);
     if (pane.code !== 0) {
       throw new Error(`Agent "${agent.name}" pane is gone (${agent.paneId}); reports can still be read with collect_spawned_reports.`);
     }
 
-    const wait = options.wait ?? true;
     const beforeReportCount = readReports(agent).length;
     const taskToSend = withReportRequest(task, options.reportKeys, options.reportInstructions);
     const lock = await pi.exec("tmux", ["wait-for", "-L", agent.signalId]);
@@ -480,6 +507,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     saveRegistry(ctx);
+    watchAgentCompletion(agent, task, beforeReportCount, ctx);
     return { agent, reports: [] };
   }
 
@@ -517,6 +545,60 @@ export default function (pi: ExtensionAPI) {
     const agents = name ? [findAgent(spawnedAgents, name)].filter((agent): agent is SpawnedAgent => !!agent) : [...spawnedAgents.values()];
     if (name && agents.length === 0) throw new Error(`Unknown spawned agent "${name}".\n${formatAgents(spawnedAgents)}`);
     return { agents, reports: agents.flatMap((agent) => readReports(agent)) };
+  }
+
+  function rememberCompletion(notice: CompletedAgentNotice): void {
+    completedNotices.push(notice);
+    completedNotices.splice(0, Math.max(0, completedNotices.length - 20));
+  }
+
+  function sendCompletionToMainAgent(notice: CompletedAgentNotice, ctx: ExtensionContext): void {
+    const resultText = notice.error
+      ? `The spawned agent failed: ${notice.error}`
+      : `The spawned agent finished.\n\nReport:\n${formatReports(notice.reports)}`;
+    const prompt = [
+      "[spawned-agent completion]",
+      `Agent: ${notice.agentName}`,
+      `Task: ${notice.task || "(no task)"}`,
+      resultText,
+      "",
+      "Parse this spawned-agent result and reply to the user as the main interface. Be concise. If the result answers an earlier user request, provide the answer now; do not merely say that the agent finished.",
+    ].join("\n");
+    try {
+      pi.sendUserMessage(prompt, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
+    } catch {
+      // If a non-interactive/runtime mode rejects synthetic user messages, the
+      // completion still remains available in completedNotices for the next turn.
+    }
+  }
+
+  function watchAgentCompletion(agent: SpawnedAgent, task: string, reportOffset: number, ctx: ExtensionContext): void {
+    void (async () => {
+      let reports: ParentReport[] = [];
+      try {
+        const done = await pi.exec("tmux", ["wait-for", "-L", agent.signalId]);
+        await pi.exec("tmux", ["wait-for", "-U", agent.signalId]);
+        if (done.code !== 0) throw new Error(done.stderr || `Failed waiting for ${agent.name}`);
+        reports = readReports(agent).slice(reportOffset);
+        if (agent.pendingReportOffset === reportOffset) {
+          delete agent.pendingTask;
+          delete agent.pendingSince;
+          delete agent.pendingReportOffset;
+        }
+        const notice = { agentName: agent.name, task, completedAt: Date.now(), reports };
+        rememberCompletion(notice);
+        saveRegistry(ctx);
+        ctx.ui.notify(`Agent "${agent.name}" finished${reports.length > 0 ? " with a report" : ""}. Asking main agent to parse it...`, "info");
+        sendCompletionToMainAgent(notice, ctx);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const notice = { agentName: agent.name, task, completedAt: Date.now(), reports, error: message };
+        rememberCompletion(notice);
+        saveRegistry(ctx);
+        ctx.ui.notify(`Agent "${agent.name}" failed: ${message}. Asking main agent to handle it...`, "error");
+        sendCompletionToMainAgent(notice, ctx);
+      }
+    })();
   }
 
   async function spawnParsedAgent(
@@ -710,7 +792,7 @@ export default function (pi: ExtensionAPI) {
     writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + "\n");
 
     const signalId = `pi-spawn-idle-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const wait = options.wait ?? true;
+    const wait = options.wait ?? false;
     const task = withReportRequest(prompt, options.reportKeys, options.reportInstructions);
     const sessionFile = ctx.sessionManager?.getSessionFile?.() ?? "";
     const contextualized = task
@@ -770,6 +852,7 @@ export default function (pi: ExtensionAPI) {
 
     const { agent, direction, requestedName, task, wait } = spawned;
     let reports: ParentReport[] = [];
+    if (task && !wait) watchAgentCompletion(agent, agent.task, 0, ctx);
     if (task && wait) {
       const done = await pi.exec("tmux", ["wait-for", "-L", agent.signalId]);
       await pi.exec("tmux", ["wait-for", "-U", agent.signalId]);
@@ -817,7 +900,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Send a task to an existing named /spawn subagent in its tmux pane",
     promptGuidelines: [
       "Use tell_spawned_agent when the user asks to tell, ask, or delegate work to a named spawned agent such as bob.",
-      "Set wait=false for independent/background work; use wait_for_spawned_agent or collect_spawned_reports later.",
+      "By default, tasks run in background and notify when complete. Set wait=true only when the current answer must include the result.",
       "Set reportKeys when you want the spawned agent to report structured JSON back to you with keys you choose.",
       "Use list_spawned_agents first if you need to know which spawned agents exist.",
     ],
@@ -837,14 +920,14 @@ export default function (pi: ExtensionAPI) {
         },
         wait: {
           type: "boolean",
-          description: "Whether to block until the subagent finishes this task. Defaults to true. Set false to run in background and use wait_for_spawned_agent or collect_spawned_reports later.",
+          description: "Whether to block until the subagent finishes this task. Defaults to false so the main agent stays responsive; set true only when the current answer depends on the result."
         },
       },
       required: ["name", "task"],
       additionalProperties: false,
     } as any,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const wait = typeof params.wait === "boolean" ? params.wait : true;
+      const wait = typeof params.wait === "boolean" ? params.wait : false;
       const { agent, reports } = await sendToAgent(params.name, params.task, ctx, {
         wait,
         reportKeys: Array.isArray(params.reportKeys) ? params.reportKeys : undefined,
@@ -853,7 +936,7 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: wait
           ? `Sent to ${agent.name} and waited for completion.\n\nReport:\n${formatReports(reports)}`
-          : `Sent to ${agent.name} in background. Use wait_for_spawned_agent or collect_spawned_reports later.` }],
+          : `Sent to ${agent.name} in background. I will notify you when it finishes; use collect_spawned_reports later if you need the report.` }],
         details: { agent, reports, wait },
       };
     },
@@ -918,7 +1001,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use spawn_agent when the user asks in plain text to spawn, hire, create an agent, create a subagent, make an agent, start, launch, or add a named agent/subagent.",
       "For requests like 'spawn bob and ask about his model', set name to 'bob' and task to 'Ask/report what model you are using.'.",
-      "Set wait=false for independent/background work; use wait_for_spawned_agent or collect_spawned_reports later.",
+      "By default, initial tasks run in background and notify when complete. Set wait=true only when the current answer must include the result.",
       "spawn_agent starts the tmux subagent immediately; /spawn remains available as a manual slash command.",
     ],
     parameters: {
@@ -937,7 +1020,7 @@ export default function (pi: ExtensionAPI) {
         },
         wait: {
           type: "boolean",
-          description: "When task is provided, whether to block until it finishes. Defaults to true. Set false to spawn and let the task run in background.",
+          description: "When task is provided, whether to block until it finishes. Defaults to false so the main agent stays responsive; set true only when the current answer depends on the result."
         },
       },
       required: ["name"],
@@ -948,14 +1031,14 @@ export default function (pi: ExtensionAPI) {
       const task = typeof params.task === "string" ? params.task.trim() : "";
       if (!name) throw new Error("spawn_agent requires a name");
 
-      const wait = typeof params.wait === "boolean" ? params.wait : true;
+      const wait = typeof params.wait === "boolean" ? params.wait : false;
       const { agent, direction, reports, requestedName } = await spawnParsedAgent(name, task, ctx, {
         wait,
         reportKeys: Array.isArray(params.reportKeys) ? params.reportKeys : undefined,
         reportInstructions: typeof params.reportInstructions === "string" ? params.reportInstructions : undefined,
       });
       return {
-        content: [{ type: "text", text: `Spawned ${agent.name} ${direction}${agent.name !== requestedName ? ` (requested ${requestedName}; renamed to avoid collision)` : ""}.${task ? (wait ? `\n\nReport:\n${formatReports(reports)}` : "\n\nTask is running in background. Use wait_for_spawned_agent or collect_spawned_reports later.") : ""}` }],
+        content: [{ type: "text", text: `Spawned ${agent.name} ${direction}${agent.name !== requestedName ? ` (requested ${requestedName}; renamed to avoid collision)` : ""}.${task ? (wait ? `\n\nReport:\n${formatReports(reports)}` : "\n\nTask is running in background. I will notify you when it finishes; use collect_spawned_reports later if you need the report.") : ""}` }],
         details: { agent, direction, reports, requestedName, wait },
       };
     },
@@ -981,11 +1064,15 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", (event) => {
+    const completedContext = completedNotices.length > 0
+      ? `\n\nRecently completed spawned-agent tasks:\n${formatCompletedNotices(completedNotices)}\nUse these results when relevant to the user's next message.`
+      : "";
+    completedNotices.length = 0;
     const spawnedContext = spawnedAgents.size > 0
-      ? `\n\nSpawned tmux subagents available for delegation:\n${formatAgents(spawnedAgents)}\nWhen the user says something like "tell bob to ...", call tell_spawned_agent with name "bob" and the requested task. If you need a structured report back from the subagent, set reportKeys to the JSON keys you want in its report. Set wait=false for background work, then call wait_for_spawned_agent when you need to join, or collect_spawned_reports to check reports without blocking. If the user asks to stop/kill/close a spawned agent, call kill_spawned_agent.`
+      ? `\n\nSpawned tmux subagents available for delegation:\n${formatAgents(spawnedAgents)}\nWhen the user says something like "tell bob to ...", call tell_spawned_agent with name "bob" and the requested task. By default, spawned-agent tasks run in background and you will be notified when they finish. Set wait=true only when the current response must include the result. If you need a structured report back from the subagent, set reportKeys to the JSON keys you want in its report. If the user asks to stop/kill/close a spawned agent, call kill_spawned_agent.`
       : "";
     return {
-      systemPrompt: `${event.systemPrompt}\n\nYou can spawn new tmux subagents with the spawn_agent tool when the user asks in plain text to spawn, hire, create an agent/subagent, make an agent, start, launch, or add an agent. For independent or parallelizable work, you may set wait=false and continue while the subagent runs; use wait_for_spawned_agent before depending on its answer. You can kill subagents with kill_spawned_agent when the user asks to despawn, kill, fire, nuke, stop, close, terminate, or remove an agent.${spawnedContext}`,
+      systemPrompt: `${event.systemPrompt}\n\nYou can spawn new tmux subagents with the spawn_agent tool when the user asks in plain text to spawn, hire, create an agent/subagent, make an agent, start, launch, or add an agent. Spawned-agent tasks run in background by default so you stay responsive; set wait=true only if the current answer must include the result. Use wait_for_spawned_agent only when you explicitly need to join a still-running task. You can kill subagents with kill_spawned_agent when the user asks to despawn, kill, fire, nuke, stop, close, terminate, or remove an agent.${spawnedContext}${completedContext}`,
     };
   });
 
@@ -1011,8 +1098,8 @@ export default function (pi: ExtensionAPI) {
 
     try {
       ctx.ui.notify(`Sending to ${name}...`, "info");
-      const { agent } = await sendToAgent(name, task, ctx, { wait: true });
-      ctx.ui.notify(`Agent "${agent.name}" finished`, "info");
+      const { agent } = await sendToAgent(name, task, ctx, { wait: false });
+      ctx.ui.notify(`Sent to agent "${agent.name}" in background. I will notify you when it finishes.`, "info");
     } catch (error) {
       ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
     }
@@ -1054,8 +1141,8 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       try {
-        const { agent } = await sendToAgent(match[1]!, match[2]!.trim(), ctx, { wait: true });
-        ctx.ui.notify(`Agent "${agent.name}" finished`, "info");
+        const { agent } = await sendToAgent(match[1]!, match[2]!.trim(), ctx, { wait: false });
+        ctx.ui.notify(`Sent to agent "${agent.name}" in background. I will notify you when it finishes.`, "info");
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
@@ -1351,6 +1438,11 @@ export default function (pi: ExtensionAPI) {
         splitArg: layout.splitArg,
         createdAt: nextSpawnCreatedAt(),
       };
+      if (prompt) {
+        agent.pendingTask = prompt;
+        agent.pendingSince = Date.now();
+        agent.pendingReportOffset = 0;
+      }
       spawnedAgents.set(name, agent);
       saveRegistry(ctx);
       await markSpawnPane(agent);
@@ -1366,24 +1458,14 @@ export default function (pi: ExtensionAPI) {
 
       const renamed = name !== requestedName ? ` (requested "${requestedName}"; renamed to avoid collision)` : "";
       const note = prompt
-        ? `Spawned "${name}" ${direction}${renamed}\nTask Assigned: ${prompt}`
+        ? `Spawned "${name}" ${direction}${renamed}\nTask assigned in background: ${prompt}`
         : `Spawned "${name}" ${direction}${renamed}`;
       ctx.ui.notify(note, "info");
-      return { prompt, signalId, name };
+      return { agent, prompt };
       });
       if (!spawned) return;
 
-      // wait for the subagent to finish its initial task
-      if (spawned.prompt) {
-        const wait = await pi.exec("tmux", ["wait-for", "-L", spawned.signalId]);
-        await pi.exec("tmux", ["wait-for", "-U", spawned.signalId]);
-        if (wait.code === 0) {
-          saveRegistry(ctx);
-          ctx.ui.notify(`Agent "${spawned.name}" finished`, "info");
-        } else {
-          ctx.ui.notify(`Failed while waiting for agent "${spawned.name}": ${wait.stderr}`, "error");
-        }
-      }
+      if (spawned.prompt) watchAgentCompletion(spawned.agent, spawned.prompt, 0, ctx);
     },
   });
 }
