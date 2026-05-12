@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -16,6 +16,10 @@ function pickName(): string {
   const idx = nameIndex++ % NAME_POOL.length;
   const suffix = Math.floor(nameIndex / NAME_POOL.length);
   return suffix > 0 ? `${NAME_POOL[idx]}${suffix}` : NAME_POOL[idx]!;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 // use the LLM to extract agent name + task from natural language
@@ -133,6 +137,18 @@ export default function (pi: ExtensionAPI) {
       mkdirSync(configDir, { recursive: true });
 
       const agentDir = join(homedir(), ".pi", "agent");
+      const agentBinDir = join(agentDir, "bin");
+      const configBinDir = join(configDir, "bin");
+      mkdirSync(configBinDir, { recursive: true });
+      for (const tool of ["fd", "rg"]) {
+        const found = await pi.exec("which", [tool]);
+        const src = found.code === 0 ? found.stdout.trim() : "";
+        if (src && existsSync(src)) {
+          const dest = join(configBinDir, tool);
+          copyFileSync(src, dest);
+          chmodSync(dest, 0o755);
+        }
+      }
       for (const file of ["settings.json", "auth.json"]) {
         const src = join(agentDir, file);
         if (existsSync(src)) {
@@ -147,33 +163,59 @@ export default function (pi: ExtensionAPI) {
       }
       settings.quietStartup = true;
 
-      // write a signal extension so the subagent notifies us when idle
+      // write a signal extension so the subagent notifies us when idle.
+      // It is auto-discovered from PI_CODING_AGENT_DIR/extensions and also
+      // added by absolute path to avoid cwd-relative settings resolution.
       const extDir = join(configDir, "extensions");
       mkdirSync(extDir, { recursive: true });
-      writeFileSync(join(extDir, "spawn-signal.ts"), [
+      const signalExtPath = join(extDir, "spawn-signal.ts");
+      writeFileSync(signalExtPath, [
         'import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";',
+        'import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";',
         "export default function (pi: ExtensionAPI) {",
         "  let signaled = false;",
-        '  pi.on("agent_end", async (_event) => {',
+        "  const agentName = process.env.PI_SPAWN_AGENT_NAME || 'subagent';",
+        '  pi.on("session_start", async (_event, ctx) => {',
+        "    if (!ctx.hasUI) return;",
+        "    ctx.ui.setTitle(`pi - ${agentName}`);",
+        '    ctx.ui.setHeader((_tui, theme) => ({',
+        "      invalidate() {},",
+        "      render(width: number): string[] {",
+        '        const label = ` ${agentName} `;',
+        '        const left = theme.fg("border", "╭─") + theme.fg("accent", theme.bold(label));',
+        '        const right = theme.fg("border", "─╮");',
+        '        const fillWidth = Math.max(0, width - visibleWidth(left) - visibleWidth(right));',
+        '        const line = left + theme.fg("border", "─".repeat(fillWidth)) + right;',
+        "        return [truncateToWidth(line, width)];",
+        "      },",
+        "    }));",
+        "  });",
+        "  async function release() {",
         "    if (signaled) return;",
         "    signaled = true;",
         '    const id = process.env.PI_SPAWN_SIGNAL_ID;',
-        '    if (id) await pi.exec("tmux", ["wait-for", "-U", id]);',
-        "  });",
+        "    if (!id) return;",
+        '    await pi.exec("tmux", ["wait-for", "-U", id]);',
+        '    await pi.exec("tmux", ["wait-for", "-S", id]);',
+        "  }",
+        '  pi.on("agent_end", release);',
+        '  pi.on("session_shutdown", release);',
         "}",
         "",
       ].join("\n"));
-      const exts = (settings.extensions as string[]) || [];
-      settings.extensions = [...exts, "extensions/spawn-signal.ts"];
+      const exts = Array.isArray(settings.extensions)
+        ? settings.extensions.filter((ext): ext is string => typeof ext === "string")
+        : [];
+      settings.extensions = [...new Set([...exts, signalExtPath])];
 
       writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + "\n");
 
       // build shell command with a signal for when the subagent becomes idle
-      const signalId = `pi-spawn-idle-${Date.now()}`;
+      const signalId = `pi-spawn-idle-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       let shellCmd: string;
       if (prompt) {
         const sessionFile = ctx.sessionManager?.getSessionFile?.() ?? "";
-        const cwd = process.cwd();
+        const cwd = ctx.cwd;
         const contextualized = [
           "[context from parent]",
           `parent session: ${sessionFile}`,
@@ -183,23 +225,33 @@ export default function (pi: ExtensionAPI) {
           prompt,
         ].join("\n");
 
-        const escaped = contextualized.replace(/'/g, "'\\''");
         shellCmd = [
-          `export PATH="${nodeDir}:${cargoDir}:$PATH"`,
-          `export PI_CODING_AGENT_DIR="${configDir}"`,
-          `export PI_SPAWN_SIGNAL_ID="${signalId}"`,
-          `${piBin} --model deepseek/deepseek-v4-flash --thinking off '${escaped}'`,
+          `export PATH=${shellQuote(nodeDir)}:${shellQuote(cargoDir)}:${shellQuote(agentBinDir)}:$PATH`,
+          `export PI_CODING_AGENT_DIR=${shellQuote(configDir)}`,
+          `export PI_SPAWN_SIGNAL_ID=${shellQuote(signalId)}`,
+          `export PI_SPAWN_AGENT_NAME=${shellQuote(name)}`,
+          `trap 'tmux wait-for -U "$PI_SPAWN_SIGNAL_ID" 2>/dev/null || true' EXIT`,
+          `${shellQuote(piBin)} --model deepseek/deepseek-v4-flash --thinking off ${shellQuote(contextualized)}`,
         ].join("; ");
       } else {
         shellCmd = [
-          `export PATH="${nodeDir}:${cargoDir}:$PATH"`,
-          `export PI_CODING_AGENT_DIR="${configDir}"`,
-          `${piBin} --model deepseek/deepseek-v4-flash --thinking off`,
+          `export PATH=${shellQuote(nodeDir)}:${shellQuote(cargoDir)}:${shellQuote(agentBinDir)}:$PATH`,
+          `export PI_CODING_AGENT_DIR=${shellQuote(configDir)}`,
+          `export PI_SPAWN_AGENT_NAME=${shellQuote(name)}`,
+          `${shellQuote(piBin)} --model deepseek/deepseek-v4-flash --thinking off`,
         ].join("; ");
       }
 
-      // lock the channel before spawning so the subagent can unlock it
-      if (prompt) await pi.exec("tmux", ["wait-for", "-L", signalId]);
+      // Race-free block: pre-lock the channel before spawn. The injected
+      // subagent extension unlocks it on agent_end; then this command's second
+      // -L call returns and the parent can notify completion.
+      if (prompt) {
+        const lock = await pi.exec("tmux", ["wait-for", "-L", signalId]);
+        if (lock.code !== 0) {
+          ctx.ui.notify(`Failed to lock tmux wait channel: ${lock.stderr}`, "error");
+          return;
+        }
+      }
 
       const result = await pi.exec("tmux", [
         "split-window", "-P", "-F", "#{pane_id}",
@@ -208,6 +260,7 @@ export default function (pi: ExtensionAPI) {
       ]);
 
       if (result.code !== 0) {
+        if (prompt) await pi.exec("tmux", ["wait-for", "-U", signalId]);
         ctx.ui.notify(
           `Failed to spawn pane: ${result.stderr || "unknown error"}`,
           "error",
@@ -229,8 +282,13 @@ export default function (pi: ExtensionAPI) {
 
       // wait for the subagent to finish its initial task
       if (prompt) {
-        await pi.exec("tmux", ["wait-for", signalId]);
-        ctx.ui.notify(`Agent "${name}" finished`, "info");
+        const wait = await pi.exec("tmux", ["wait-for", "-L", signalId]);
+        await pi.exec("tmux", ["wait-for", "-U", signalId]);
+        if (wait.code === 0) {
+          ctx.ui.notify(`Agent "${name}" finished`, "info");
+        } else {
+          ctx.ui.notify(`Failed while waiting for agent "${name}": ${wait.stderr}`, "error");
+        }
       }
     },
   });
