@@ -188,7 +188,7 @@ async function parseWithLLM(
 export default function (pi: ExtensionAPI) {
   const spawnedAgents = new Map<string, SpawnedAgent>();
   let mainPaneId = process.env.TMUX_PANE;
-  let firstSubagentSplitArg: "-h" | "-v" | undefined;
+  let spawnQueue: Promise<void> = Promise.resolve();
 
   // Future reference: focus/click auto-resize was prototyped with a tmux
   // after-select-pane hook and a generated resize script. Disabled for now
@@ -204,30 +204,74 @@ export default function (pi: ExtensionAPI) {
     return result.code === 0;
   }
 
+  function withSpawnLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = spawnQueue.then(fn, fn);
+    spawnQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  type LiveSpawnPane = {
+    paneId: string;
+    name: string;
+    splitArg: "-h" | "-v";
+    width: number;
+    height: number;
+  };
+
+  async function resolveMainPaneId(): Promise<string> {
+    if (mainPaneId && await paneExists(mainPaneId)) return mainPaneId;
+    const current = await pi.exec("tmux", ["display-message", "-p", "#{pane_id}"]);
+    if (current.code !== 0) throw new Error("Failed to resolve main tmux pane");
+    mainPaneId = current.stdout.trim();
+    return mainPaneId;
+  }
+
+  async function listLiveSpawnPanes(): Promise<LiveSpawnPane[]> {
+    const owner = await resolveMainPaneId();
+    const listed = await pi.exec("tmux", [
+      "list-panes",
+      "-F",
+      "#{pane_id}\t#{@pi_spawn_owner}\t#{@pi_spawn_agent_name}\t#{@pi_spawn_split_arg}\t#{pane_width}\t#{pane_height}",
+    ]);
+    if (listed.code !== 0) return [];
+
+    const live = listed.stdout
+      .split("\n")
+      .filter((line) => line.trim())
+      .flatMap((line): LiveSpawnPane[] => {
+        const [paneId, paneOwner, name, splitArg, width, height] = line.split("\t");
+        if (paneOwner !== owner || !paneId || !name || (splitArg !== "-h" && splitArg !== "-v")) return [];
+        return [{ paneId, name, splitArg, width: parseInt(width || "0", 10), height: parseInt(height || "0", 10) }];
+      });
+
+    for (const agent of [...spawnedAgents.values()]) {
+      if (!live.some((pane) => pane.paneId === agent.paneId)) spawnedAgents.delete(agent.name);
+    }
+    return live;
+  }
+
+  async function markSpawnPane(agent: SpawnedAgent): Promise<void> {
+    const owner = await resolveMainPaneId();
+    await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_owner", owner]);
+    await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_agent_name", agent.name]);
+    await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_split_arg", agent.splitArg]);
+  }
+
   async function getSpawnLayout(defaultSplitArg: "-h" | "-v"): Promise<{
     targetPaneId: string;
     splitArg: "-h" | "-v";
     percent: string;
   }> {
-    const liveAgents: SpawnedAgent[] = [];
-    for (const agent of spawnedAgents.values()) {
-      if (await paneExists(agent.paneId)) liveAgents.push(agent);
-      else spawnedAgents.delete(agent.name);
+    const livePanes = await listLiveSpawnPanes();
+
+    if (livePanes.length === 0) {
+      return { targetPaneId: await resolveMainPaneId(), splitArg: defaultSplitArg, percent: "40" };
     }
 
-    if (liveAgents.length === 0) {
-      firstSubagentSplitArg = defaultSplitArg;
-      if (!mainPaneId || !(await paneExists(mainPaneId))) {
-        const current = await pi.exec("tmux", ["display-message", "-p", "#{pane_id}"]);
-        if (current.code !== 0) throw new Error("Failed to resolve main tmux pane");
-        mainPaneId = current.stdout.trim();
-      }
-      return { targetPaneId: mainPaneId, splitArg: defaultSplitArg, percent: "40" };
-    }
-
+    const target = livePanes.sort((a, b) => (b.width * b.height) - (a.width * a.height))[0]!;
     return {
-      targetPaneId: liveAgents[0]!.paneId,
-      splitArg: oppositeSplitArg(firstSubagentSplitArg ?? liveAgents[0]!.splitArg),
+      targetPaneId: target.paneId,
+      splitArg: oppositeSplitArg(target.splitArg),
       percent: "50",
     };
   }
@@ -247,7 +291,6 @@ export default function (pi: ExtensionAPI) {
 
     await pi.exec("tmux", ["wait-for", "-U", agent.signalId]);
     spawnedAgents.delete(agent.name);
-    if (spawnedAgents.size === 0) firstSubagentSplitArg = undefined;
     return { agent, wasRunning };
   }
 
@@ -263,7 +306,6 @@ export default function (pi: ExtensionAPI) {
         spawnedAgents.delete(agent.name);
       }
     }
-    firstSubagentSplitArg = undefined;
   }
 
   pi.on("session_shutdown", async (event) => {
@@ -323,6 +365,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     options: { reportKeys?: string[]; reportInstructions?: string } = {},
   ): Promise<{ agent: SpawnedAgent; direction: string; reports: ParentReport[]; requestedName: string }> {
+    return withSpawnLock(async () => {
     const requestedName = name;
     name = uniqueAgentName(spawnedAgents, name);
 
@@ -505,6 +548,7 @@ export default function (pi: ExtensionAPI) {
     const paneId = result.stdout.trim();
     const agent: SpawnedAgent = { name, paneId, signalId, task: prompt, configDir, reportFile, splitArg: layout.splitArg, createdAt: Date.now() };
     spawnedAgents.set(name, agent);
+    await markSpawnPane(agent);
     await pi.exec("tmux", ["select-pane", "-t", paneId, "-T", name]);
     if (mainPaneId && await paneExists(mainPaneId)) {
       await pi.exec("tmux", ["select-pane", "-t", mainPaneId]);
@@ -519,6 +563,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     return { agent, direction, reports, requestedName };
+    });
   }
 
   pi.registerTool({
@@ -957,7 +1002,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const paneId = result.stdout.trim();
-      spawnedAgents.set(name, {
+      const agent: SpawnedAgent = {
         name,
         paneId,
         signalId,
@@ -966,7 +1011,9 @@ export default function (pi: ExtensionAPI) {
         reportFile,
         splitArg: layout.splitArg,
         createdAt: Date.now(),
-      });
+      };
+      spawnedAgents.set(name, agent);
+      await markSpawnPane(agent);
 
       // set the pane title so the name sticks to the top bar
       await pi.exec("tmux", [

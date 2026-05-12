@@ -44,8 +44,8 @@ Spawned agents are tracked by name and pane id in the main extension runtime.
 - The main agent also gets spawned-agent context in its system prompt and can use the `list_spawned_agents`, `tell_spawned_agent`, `spawn_agent`, and `kill_spawned_agent` tools when useful.
 - If the main agent no longer needs a subagent, it can call `kill_spawned_agent` on its own.
 - When the main agent quits normally, all tracked spawned-agent panes are killed as well.
-- Pane layout is stable: the main agent keeps about 60% of the window, spawned agents share the remaining 40%.
-- Additional spawned agents split inside the existing spawned-agent area, using the opposite split direction from the first spawn.
+- Pane layout is stable and serialized: the main agent keeps about 60% of the window, spawned agents share the remaining 40%.
+- Additional spawned agents split inside the existing spawned-agent area, using tmux pane metadata to discover the current layout instead of relying on in-memory ordering.
 
 ## Reports back to the main agent
 
