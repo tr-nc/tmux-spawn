@@ -29,6 +29,7 @@ function shellQuote(value: string): string {
 
 type SpawnModelTier = "fast" | "strong";
 type SpawnModelSelection = "auto" | "explicit";
+type SpawnContextMode = "none" | "current" | "entry";
 
 type SpawnModelConfig = {
   fastModel: string;
@@ -198,6 +199,29 @@ function inferSpawnModelTier(text: string): SpawnModelTier {
   return /\b(complex|hard|difficult|research|analy[sz]e|design|architect|implement|code|debug|review|plan|refactor|security)\b/i.test(text)
     ? "strong"
     : "fast";
+}
+
+function formatSessionEntryForSpawn(entry: unknown): string {
+  const value = entry as any;
+  if (value?.type === "message") {
+    return JSON.stringify({ id: value.id, role: value.message?.role, content: value.message?.content }, null, 2);
+  }
+  if (value?.type === "compaction" || value?.type === "branch_summary") {
+    return JSON.stringify({ id: value.id, type: value.type, summary: value.summary }, null, 2);
+  }
+  if (value?.type === "custom_message") {
+    return JSON.stringify({ id: value.id, type: value.type, customType: value.customType, content: value.content }, null, 2);
+  }
+  return JSON.stringify(value, null, 2);
+}
+
+function buildSpawnContext(ctx: ExtensionContext, mode: SpawnContextMode = "none", entryId?: string): string {
+  if (mode === "none") return "";
+  const leafId = mode === "entry" ? entryId?.trim() : ctx.sessionManager.getLeafId();
+  if (!leafId) return "";
+  if (!ctx.sessionManager.getEntry(leafId)) throw new Error(`Unknown context entry id "${leafId}"`);
+  const branch = ctx.sessionManager.getBranch(leafId);
+  return branch.map(formatSessionEntryForSpawn).join("\n\n");
 }
 
 function withReportRequest(task: string, reportKeys?: string[], reportInstructions?: string): string {
@@ -671,7 +695,7 @@ export default function (pi: ExtensionAPI) {
     name: string,
     prompt: string,
     ctx: ExtensionContext,
-    options: { wait?: boolean; reportKeys?: string[]; reportInstructions?: string; modelTier?: SpawnModelTier } = {},
+    options: { wait?: boolean; reportKeys?: string[]; reportInstructions?: string; modelTier?: SpawnModelTier; contextMode?: SpawnContextMode; contextEntryId?: string } = {},
   ): Promise<{ agent: SpawnedAgent; direction: string; reports: ParentReport[]; requestedName: string }> {
     loadRegistry(ctx);
     const spawned = await withSpawnLock(async () => {
@@ -834,9 +858,12 @@ export default function (pi: ExtensionAPI) {
     const wait = options.wait ?? false;
     const task = withReportRequest(prompt, options.reportKeys, options.reportInstructions);
     const sessionFile = ctx.sessionManager?.getSessionFile?.() ?? "";
+    const parentContext = buildSpawnContext(ctx, options.contextMode ?? "none", options.contextEntryId);
+    const contextLines = ["[context from parent]", `parent session: ${sessionFile}`, `cwd: ${ctx.cwd}`, `agent name: ${name}`];
+    if (parentContext) contextLines.push("", "[selected parent context tree]", parentContext);
     const contextualized = task
-      ? ["[context from parent]", `parent session: ${sessionFile}`, `cwd: ${ctx.cwd}`, `agent name: ${name}`, "", task].join("\n")
-      : "";
+      ? [...contextLines, "", task].join("\n")
+      : (parentContext ? contextLines.join("\n") : "");
 
     const shellParts = [
       `export PATH=${shellQuote(nodeDir)}:${shellQuote(cargoDir)}:${shellQuote(agentBinDir)}:$PATH`,
@@ -1044,6 +1071,7 @@ export default function (pi: ExtensionAPI) {
       "For requests like 'ask bob to get the weather', if bob does not already exist, set name to 'bob' and task to 'Get the weather'.",
       "The selected model is fixed for that subagent after spawn.",
       "If model selection is explicit and the user did not specify fast or strong, ask the user which tier to use before calling spawn_agent. If model selection is auto, you may omit modelTier and the extension will choose from the task.",
+      "Set contextMode=none/current/entry to decide which parent context tree to inject. Use current for the active branch, entry with contextEntryId for a specific tree node, or none for a clean subagent.",
       "By default, initial tasks run in background and notify when complete. Set wait=true only when the current answer must include the result.",
       "spawn_agent starts the tmux subagent immediately; /spawn remains available as a manual slash command.",
     ],
@@ -1066,6 +1094,15 @@ export default function (pi: ExtensionAPI) {
           enum: ["fast", "strong"],
           description: "Model tier for the new subagent. Required only when tmuxSpawn.modelSelection is explicit; in auto mode it can be omitted and inferred from the task. Cannot be changed after spawn.",
         },
+        contextMode: {
+          type: "string",
+          enum: ["none", "current", "entry"],
+          description: "Which parent context tree to inject into the new subagent. Defaults to none. Use current for the active branch, entry for a specific entry id.",
+        },
+        contextEntryId: {
+          type: "string",
+          description: "Entry id to use when contextMode is entry.",
+        },
         wait: {
           type: "boolean",
           description: "When task is provided, whether to block until it finishes. Defaults to false so the main agent stays responsive; set true only when the current answer depends on the result.",
@@ -1087,11 +1124,14 @@ export default function (pi: ExtensionAPI) {
       const modelTier: SpawnModelTier = params.modelTier === "fast" || params.modelTier === "strong"
         ? params.modelTier
         : inferSpawnModelTier(`${name}\n${task}`);
+      const contextMode: SpawnContextMode = params.contextMode === "current" || params.contextMode === "entry" ? params.contextMode : "none";
       const { agent, direction, reports, requestedName } = await spawnParsedAgent(name, task, ctx, {
         wait,
         reportKeys: Array.isArray(params.reportKeys) ? params.reportKeys : undefined,
         reportInstructions: typeof params.reportInstructions === "string" ? params.reportInstructions : undefined,
         modelTier,
+        contextMode,
+        contextEntryId: typeof params.contextEntryId === "string" ? params.contextEntryId : undefined,
       });
       return {
         content: [{ type: "text", text: `Spawned ${agent.name} ${direction}${agent.name !== requestedName ? ` (requested ${requestedName}; renamed to avoid collision)` : ""} using ${agent.modelTier ?? "fast"} model${agent.model ? ` (${agent.model})` : ""}.${task ? (wait ? `\n\nReport:\n${formatReports(reports)}` : "\n\nTask is running in background. I will notify you when it finishes; use collect_spawned_reports later if you need the report.") : ""}` }],

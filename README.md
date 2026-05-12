@@ -75,6 +75,16 @@ Spawned agents are tracked by name and pane id in the main extension runtime, pe
 - Pane layout is stable and serialized: the main agent keeps about 60% of the window, spawned agents share the remaining 40%.
 - Additional spawned agents split inside the existing spawned-agent area, using tmux pane metadata to discover the current layout instead of relying on in-memory ordering.
 
+## Parent context injection
+
+When spawning via the `spawn_agent` tool, the parent can choose which conversation tree to inject into the subagent's initial prompt:
+
+- `contextMode: "none"` (default): clean subagent with only cwd/session metadata and task.
+- `contextMode: "current"`: inject the active parent branch.
+- `contextMode: "entry"` plus `contextEntryId`: inject the branch ending at a specific parent entry.
+
+This is fixed at subagent creation time; follow-up tasks preserve the subagent's own session context.
+
 ## Reports back to the main agent
 
 Spawned agents get an injected `report_to_parent` tool. When the main agent uses `spawn_agent` or `tell_spawned_agent`, it can choose `reportKeys` (for example `["status", "summary", "files"]`). The subagent is instructed to call `report_to_parent` with a JSON object using those keys.
