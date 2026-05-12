@@ -652,7 +652,7 @@ export default function (pi: ExtensionAPI) {
       `Task: ${notice.task || "(no task)"}`,
       resultText,
       "",
-      "Parse this spawned-agent result and reply to the user as the main interface. Be concise. If the result answers an earlier user request, provide the answer now; do not merely say that the agent finished.",
+      "Parse this spawned-agent result and reply to the user as the main interface. Be concise. If the result answers an earlier user request, provide the answer now; do not merely say that the agent finished. If this was a short-term agent and you are satisfied with the result, you may call kill_spawned_agent for this agent without asking the user."
     ].join("\n");
     try {
       pi.sendUserMessage(prompt, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
@@ -940,6 +940,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Kill a named /spawn tmux subagent pane",
     promptGuidelines: [
       "Use kill_spawned_agent when the user asks to despawn, kill, fire, nuke, stop, close, terminate, or remove a named spawned agent.",
+      "You may also use kill_spawned_agent on your own for short-term agents after their task is complete and their result has been handled, when preserving their session is not useful.",
       "Use list_spawned_agents first if you need to know which spawned agents exist.",
     ],
     parameters: {
