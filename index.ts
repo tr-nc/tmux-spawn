@@ -251,6 +251,25 @@ export default function (pi: ExtensionAPI) {
     return { agent, wasRunning };
   }
 
+  async function killAllAgents(): Promise<void> {
+    for (const agent of [...spawnedAgents.values()]) {
+      try {
+        const pane = await pi.exec("tmux", ["display-message", "-p", "-t", agent.paneId, "#{pane_id}"]);
+        if (pane.code === 0) await pi.exec("tmux", ["kill-pane", "-t", agent.paneId]);
+        await pi.exec("tmux", ["wait-for", "-U", agent.signalId]);
+      } catch {
+        // best effort during shutdown
+      } finally {
+        spawnedAgents.delete(agent.name);
+      }
+    }
+    firstSubagentSplitArg = undefined;
+  }
+
+  pi.on("session_shutdown", async (event) => {
+    if (event.reason === "quit") await killAllAgents();
+  });
+
   async function sendToAgent(
     name: string,
     task: string,
