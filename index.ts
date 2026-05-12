@@ -12,6 +12,9 @@ const NAME_POOL = [
   "rift", "surf", "drift", "prism", "shard", "ember", "crest",
 ];
 
+const DEFAULT_FAST_MODEL = "deepseek/deepseek-v4-flash";
+const DEFAULT_STRONG_MODEL = "gpt5.5";
+
 let nameIndex = 0;
 function pickName(): string {
   const idx = nameIndex++ % NAME_POOL.length;
@@ -22,6 +25,13 @@ function pickName(): string {
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
+
+type SpawnModelTier = "fast" | "strong";
+
+type SpawnModelConfig = {
+  fastModel: string;
+  strongModel: string;
+};
 
 type ParentReport = {
   type: string;
@@ -50,6 +60,8 @@ type SpawnedAgent = {
   reportFile: string;
   splitArg: "-h" | "-v";
   createdAt: number;
+  model?: string;
+  modelTier?: SpawnModelTier;
   pendingTask?: string;
   pendingSince?: number;
   pendingReportOffset?: number;
@@ -93,7 +105,7 @@ function uniqueAgentName(agents: Map<string, SpawnedAgent>, requested: string): 
 function formatAgents(agents: Map<string, SpawnedAgent>): string {
   if (agents.size === 0) return "No spawned agents.";
   return [...agents.values()]
-    .map((agent) => `- ${agent.name}${agent.pendingTask ? " [running]" : ""}${agent.task ? `: ${agent.task}` : ""}`)
+    .map((agent) => `- ${agent.name}${agent.pendingTask ? " [running]" : ""}${agent.modelTier ? ` [${agent.modelTier}]` : ""}${agent.task ? `: ${agent.task}` : ""}`)
     .join("\n");
 }
 
@@ -134,6 +146,42 @@ function formatCompletedNotices(notices: CompletedAgentNotice[]): string {
       ].filter((line): line is string => !!line).join("\n");
     })
     .join("\n\n");
+}
+
+function readJsonFile(path: string): Record<string, unknown> | undefined {
+  if (!existsSync(path)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function applySpawnConfig(settings: Record<string, unknown> | undefined, config: SpawnModelConfig): void {
+  const section = settings?.tmuxSpawn;
+  if (!section || typeof section !== "object" || Array.isArray(section)) return;
+  const values = section as Record<string, unknown>;
+  if (typeof values.fastModel === "string" && values.fastModel.trim()) config.fastModel = values.fastModel.trim();
+  if (typeof values.strongModel === "string" && values.strongModel.trim()) config.strongModel = values.strongModel.trim();
+}
+
+function getSpawnModelConfig(ctx?: ExtensionContext): SpawnModelConfig {
+  const config: SpawnModelConfig = { fastModel: DEFAULT_FAST_MODEL, strongModel: DEFAULT_STRONG_MODEL };
+  applySpawnConfig(readJsonFile(join(homedir(), ".pi", "agent", "settings.json")), config);
+  if (ctx?.cwd) applySpawnConfig(readJsonFile(join(ctx.cwd, ".pi", "settings.json")), config);
+  if (process.env.PI_SPAWN_FAST_MODEL?.trim()) config.fastModel = process.env.PI_SPAWN_FAST_MODEL.trim();
+  if (process.env.PI_SPAWN_STRONG_MODEL?.trim()) config.strongModel = process.env.PI_SPAWN_STRONG_MODEL.trim();
+  return config;
+}
+
+function resolveSpawnModel(tier: SpawnModelTier, ctx?: ExtensionContext): string {
+  const config = getSpawnModelConfig(ctx);
+  return tier === "strong" ? config.strongModel : config.fastModel;
+}
+
+function inferSpawnModelTier(text: string): SpawnModelTier {
+  return /\b(strong|gpt\s*-?\s*5(?:\.5)?|gpt5(?:\.5)?)\b/i.test(text) ? "strong" : "fast";
 }
 
 function withReportRequest(task: string, reportKeys?: string[], reportInstructions?: string): string {
@@ -179,7 +227,7 @@ async function parseWithLLM(
     const result = await pi.exec(piBin, [
       "-p", "--no-session",
       "--no-context-files", "--no-extensions",
-      "--model", "deepseek/deepseek-v4-flash",
+      "--model", DEFAULT_FAST_MODEL,
       "--thinking", "off",
       "--system-prompt", systemMsg,
       input,
@@ -365,6 +413,8 @@ export default function (pi: ExtensionAPI) {
     await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_report_file", agent.reportFile]);
     await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_config_dir", agent.configDir]);
     await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_created_at", String(agent.createdAt)]);
+    if (agent.model) await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_model", agent.model]);
+    if (agent.modelTier) await pi.exec("tmux", ["set-option", "-p", "-t", agent.paneId, "@pi_spawn_model_tier", agent.modelTier]);
   }
 
   function sortLivePanesByCreation(panes: LiveSpawnPane[]): LiveSpawnPane[] {
@@ -605,7 +655,7 @@ export default function (pi: ExtensionAPI) {
     name: string,
     prompt: string,
     ctx: ExtensionContext,
-    options: { wait?: boolean; reportKeys?: string[]; reportInstructions?: string } = {},
+    options: { wait?: boolean; reportKeys?: string[]; reportInstructions?: string; modelTier?: SpawnModelTier } = {},
   ): Promise<{ agent: SpawnedAgent; direction: string; reports: ParentReport[]; requestedName: string }> {
     loadRegistry(ctx);
     const spawned = await withSpawnLock(async () => {
@@ -617,6 +667,8 @@ export default function (pi: ExtensionAPI) {
     if (whichPi.code !== 0 || whichNode.code !== 0) throw new Error("pi or node not found on PATH");
 
     const piBin = whichPi.stdout.trim();
+    const modelTier = options.modelTier ?? "fast";
+    const spawnModel = resolveSpawnModel(modelTier, ctx);
     const nodeDir = join(whichNode.stdout.trim(), "..");
     const cargoDir = join(homedir(), ".cargo", "bin");
 
@@ -807,8 +859,8 @@ export default function (pi: ExtensionAPI) {
       `export PI_SPAWN_REPORT_FILE=${shellQuote(reportFile)}`,
       `trap 'tmux wait-for -U "$PI_SPAWN_SIGNAL_ID" 2>/dev/null || true' EXIT`,
       task
-        ? `${shellQuote(piBin)} --model deepseek/deepseek-v4-flash --thinking off ${shellQuote(contextualized)}`
-        : `${shellQuote(piBin)} --model deepseek/deepseek-v4-flash --thinking off`,
+        ? `${shellQuote(piBin)} --model ${shellQuote(spawnModel)} --thinking off ${shellQuote(contextualized)}`
+        : `${shellQuote(piBin)} --model ${shellQuote(spawnModel)} --thinking off`,
     ];
     const shellCmd = shellParts.join("; ");
 
@@ -830,7 +882,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     const paneId = result.stdout.trim();
-    const agent: SpawnedAgent = { name, paneId, signalId, task: prompt, configDir, reportFile, splitArg: layout.splitArg, createdAt: nextSpawnCreatedAt() };
+    const agent: SpawnedAgent = { name, paneId, signalId, task: prompt, configDir, reportFile, splitArg: layout.splitArg, createdAt: nextSpawnCreatedAt(), model: spawnModel, modelTier };
     if (task && !wait) {
       agent.pendingTask = prompt;
       agent.pendingSince = Date.now();
@@ -1003,6 +1055,8 @@ export default function (pi: ExtensionAPI) {
       "Use spawn_agent when the user asks in plain text to spawn, hire, create an agent, create a subagent, make an agent, start, launch, or add a named agent/subagent.",
       "For requests like 'spawn bob and ask about his model', set name to 'bob' and task to 'Ask/report what model you are using.'.",
       "For requests like 'ask bob to get the weather', if bob does not already exist, set name to 'bob' and task to 'Get the weather'.",
+      "Choose modelTier=fast for simple or latency-sensitive tasks; choose modelTier=strong for complex reasoning, coding, research, or when the user explicitly asks for the strong model. If the user explicitly asks for fast/strong, follow that.",
+      "The selected model is fixed for that subagent after spawn.",
       "By default, initial tasks run in background and notify when complete. Set wait=true only when the current answer must include the result.",
       "spawn_agent starts the tmux subagent immediately; /spawn remains available as a manual slash command.",
     ],
@@ -1020,9 +1074,14 @@ export default function (pi: ExtensionAPI) {
           type: "string",
           description: "Optional extra instructions for the subagent's structured report",
         },
+        modelTier: {
+          type: "string",
+          enum: ["fast", "strong"],
+          description: "Model tier for the new subagent. Defaults to fast. Use strong for complex tasks or when explicitly requested. Cannot be changed after spawn.",
+        },
         wait: {
           type: "boolean",
-          description: "When task is provided, whether to block until it finishes. Defaults to false so the main agent stays responsive; set true only when the current answer depends on the result."
+          description: "When task is provided, whether to block until it finishes. Defaults to false so the main agent stays responsive; set true only when the current answer depends on the result.",
         },
       },
       required: ["name"],
@@ -1034,13 +1093,15 @@ export default function (pi: ExtensionAPI) {
       if (!name) throw new Error("spawn_agent requires a name");
 
       const wait = typeof params.wait === "boolean" ? params.wait : false;
+      const modelTier: SpawnModelTier = params.modelTier === "strong" ? "strong" : "fast";
       const { agent, direction, reports, requestedName } = await spawnParsedAgent(name, task, ctx, {
         wait,
         reportKeys: Array.isArray(params.reportKeys) ? params.reportKeys : undefined,
         reportInstructions: typeof params.reportInstructions === "string" ? params.reportInstructions : undefined,
+        modelTier,
       });
       return {
-        content: [{ type: "text", text: `Spawned ${agent.name} ${direction}${agent.name !== requestedName ? ` (requested ${requestedName}; renamed to avoid collision)` : ""}.${task ? (wait ? `\n\nReport:\n${formatReports(reports)}` : "\n\nTask is running in background. I will notify you when it finishes; use collect_spawned_reports later if you need the report.") : ""}` }],
+        content: [{ type: "text", text: `Spawned ${agent.name} ${direction}${agent.name !== requestedName ? ` (requested ${requestedName}; renamed to avoid collision)` : ""} using ${agent.modelTier ?? "fast"} model${agent.model ? ` (${agent.model})` : ""}.${task ? (wait ? `\n\nReport:\n${formatReports(reports)}` : "\n\nTask is running in background. I will notify you when it finishes; use collect_spawned_reports later if you need the report.") : ""}` }],
         details: { agent, direction, reports, requestedName, wait },
       };
     },
@@ -1176,6 +1237,8 @@ export default function (pi: ExtensionAPI) {
       const requestedName = parsed.name;
       const name = uniqueAgentName(spawnedAgents, requestedName);
       const prompt = parsed.prompt;
+      const modelTier = inferSpawnModelTier(rawInput);
+      const spawnModel = resolveSpawnModel(modelTier, ctx);
 
       // Get current tmux window dimensions in characters and cell pixel sizes
       const dims = await pi.exec("tmux", [
@@ -1387,7 +1450,7 @@ export default function (pi: ExtensionAPI) {
           `export PI_SPAWN_AGENT_NAME=${shellQuote(name)}`,
           `export PI_SPAWN_REPORT_FILE=${shellQuote(reportFile)}`,
           `trap 'tmux wait-for -U "$PI_SPAWN_SIGNAL_ID" 2>/dev/null || true' EXIT`,
-          `${shellQuote(piBin)} --model deepseek/deepseek-v4-flash --thinking off ${shellQuote(contextualized)}`,
+          `${shellQuote(piBin)} --model ${shellQuote(spawnModel)} --thinking off ${shellQuote(contextualized)}`,
         ].join("; ");
       } else {
         shellCmd = [
@@ -1397,7 +1460,7 @@ export default function (pi: ExtensionAPI) {
           `export PI_SPAWN_AGENT_NAME=${shellQuote(name)}`,
           `export PI_SPAWN_REPORT_FILE=${shellQuote(reportFile)}`,
           `trap 'tmux wait-for -U "$PI_SPAWN_SIGNAL_ID" 2>/dev/null || true' EXIT`,
-          `${shellQuote(piBin)} --model deepseek/deepseek-v4-flash --thinking off`,
+          `${shellQuote(piBin)} --model ${shellQuote(spawnModel)} --thinking off`,
         ].join("; ");
       }
 
@@ -1439,6 +1502,8 @@ export default function (pi: ExtensionAPI) {
         reportFile,
         splitArg: layout.splitArg,
         createdAt: nextSpawnCreatedAt(),
+        model: spawnModel,
+        modelTier,
       };
       if (prompt) {
         agent.pendingTask = prompt;
@@ -1459,9 +1524,10 @@ export default function (pi: ExtensionAPI) {
       }
 
       const renamed = name !== requestedName ? ` (requested "${requestedName}"; renamed to avoid collision)` : "";
+      const modelNote = ` using ${modelTier} model (${spawnModel})`;
       const note = prompt
-        ? `Spawned "${name}" ${direction}${renamed}\nTask assigned in background: ${prompt}`
-        : `Spawned "${name}" ${direction}${renamed}`;
+        ? `Spawned "${name}" ${direction}${renamed}${modelNote}\nTask assigned in background: ${prompt}`
+        : `Spawned "${name}" ${direction}${renamed}${modelNote}`;
       ctx.ui.notify(note, "info");
       return { agent, prompt };
       });

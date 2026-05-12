@@ -28,6 +28,28 @@ spawn bob and ask about his model
 
 The command/tool path parses the input into an agent name and task, creates a temporary Pi config, injects a `spawn-signal.ts` extension, then starts Pi in a tmux split.
 
+## Model tiers
+
+New subagents choose one immutable model at spawn time. The main agent can set `modelTier` on `spawn_agent`:
+
+- `fast` (default): `deepseek/deepseek-v4-flash`
+- `strong` (default): `gpt5.5`
+
+The main agent should choose `fast` for simple or latency-sensitive tasks and `strong` for complex reasoning/coding/research, unless the user explicitly asks for fast or strong.
+
+Configure model IDs in `~/.pi/agent/settings.json` or `.pi/settings.json`:
+
+```json
+{
+  "tmuxSpawn": {
+    "fastModel": "deepseek/deepseek-v4-flash",
+    "strongModel": "gpt5.5"
+  }
+}
+```
+
+Environment overrides are also supported: `PI_SPAWN_FAST_MODEL` and `PI_SPAWN_STRONG_MODEL`.
+
 ## Spawned-agent name bar
 
 Each spawned Pi receives `PI_SPAWN_AGENT_NAME` and the injected extension draws a one-line top header with `ctx.ui.setHeader()`, e.g. `> bob`. It also writes the same label into Pi's status bar with `ctx.ui.setStatus()` so the name remains visible when the pane is scrolled. This is rendered by Pi's TUI framework, not by tmux. The tmux pane title is still set to the same name as a fallback.
