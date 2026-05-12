@@ -14,6 +14,7 @@ const NAME_POOL = [
 
 const DEFAULT_FAST_MODEL = "deepseek/deepseek-v4-flash";
 const DEFAULT_STRONG_MODEL = "gpt5.5";
+const DEFAULT_MODEL_SELECTION: SpawnModelSelection = "auto";
 
 let nameIndex = 0;
 function pickName(): string {
@@ -27,10 +28,12 @@ function shellQuote(value: string): string {
 }
 
 type SpawnModelTier = "fast" | "strong";
+type SpawnModelSelection = "auto" | "explicit";
 
 type SpawnModelConfig = {
   fastModel: string;
   strongModel: string;
+  modelSelection: SpawnModelSelection;
 };
 
 type ParentReport = {
@@ -164,14 +167,18 @@ function applySpawnConfig(settings: Record<string, unknown> | undefined, config:
   const values = section as Record<string, unknown>;
   if (typeof values.fastModel === "string" && values.fastModel.trim()) config.fastModel = values.fastModel.trim();
   if (typeof values.strongModel === "string" && values.strongModel.trim()) config.strongModel = values.strongModel.trim();
+  if (values.modelSelection === "auto" || values.modelSelection === "explicit") config.modelSelection = values.modelSelection;
 }
 
 function getSpawnModelConfig(ctx?: ExtensionContext): SpawnModelConfig {
-  const config: SpawnModelConfig = { fastModel: DEFAULT_FAST_MODEL, strongModel: DEFAULT_STRONG_MODEL };
+  const config: SpawnModelConfig = { fastModel: DEFAULT_FAST_MODEL, strongModel: DEFAULT_STRONG_MODEL, modelSelection: DEFAULT_MODEL_SELECTION };
   applySpawnConfig(readJsonFile(join(homedir(), ".pi", "agent", "settings.json")), config);
   if (ctx?.cwd) applySpawnConfig(readJsonFile(join(ctx.cwd, ".pi", "settings.json")), config);
   if (process.env.PI_SPAWN_FAST_MODEL?.trim()) config.fastModel = process.env.PI_SPAWN_FAST_MODEL.trim();
   if (process.env.PI_SPAWN_STRONG_MODEL?.trim()) config.strongModel = process.env.PI_SPAWN_STRONG_MODEL.trim();
+  if (process.env.PI_SPAWN_MODEL_SELECTION === "auto" || process.env.PI_SPAWN_MODEL_SELECTION === "explicit") {
+    config.modelSelection = process.env.PI_SPAWN_MODEL_SELECTION;
+  }
   return config;
 }
 
@@ -184,6 +191,13 @@ function explicitSpawnModelTier(text: string): SpawnModelTier | undefined {
   if (/\b(strong|gpt\s*-?\s*5(?:\.5)?|gpt5(?:\.5)?)\b/i.test(text)) return "strong";
   if (/\b(fast|quick|deepseek|v4\s*flash|flash)\b/i.test(text)) return "fast";
   return undefined;
+}
+
+function inferSpawnModelTier(text: string): SpawnModelTier {
+  if (explicitSpawnModelTier(text)) return explicitSpawnModelTier(text)!;
+  return /\b(complex|hard|difficult|research|analy[sz]e|design|architect|implement|code|debug|review|plan|refactor|security)\b/i.test(text)
+    ? "strong"
+    : "fast";
 }
 
 function withReportRequest(task: string, reportKeys?: string[], reportInstructions?: string): string {
@@ -1061,7 +1075,7 @@ export default function (pi: ExtensionAPI) {
       "For requests like 'spawn bob and ask about his model', set name to 'bob' and task to 'Ask/report what model you are using.'.",
       "For requests like 'ask bob to get the weather', if bob does not already exist, set name to 'bob' and task to 'Get the weather'.",
       "The selected model is fixed for that subagent after spawn.",
-      "If the user did not explicitly specify fast or strong for this new subagent, ask the user which model tier to use before calling spawn_agent.",
+      "If model selection is explicit and the user did not specify fast or strong, ask the user which tier to use before calling spawn_agent. If model selection is auto, you may omit modelTier and the extension will choose from the task.",
       "By default, initial tasks run in background and notify when complete. Set wait=true only when the current answer must include the result.",
       "spawn_agent starts the tmux subagent immediately; /spawn remains available as a manual slash command.",
     ],
@@ -1082,14 +1096,14 @@ export default function (pi: ExtensionAPI) {
         modelTier: {
           type: "string",
           enum: ["fast", "strong"],
-          description: "Required model tier for the new subagent. Ask the user if they did not explicitly specify fast or strong. Cannot be changed after spawn.",
+          description: "Model tier for the new subagent. Required only when tmuxSpawn.modelSelection is explicit; in auto mode it can be omitted and inferred from the task. Cannot be changed after spawn.",
         },
         wait: {
           type: "boolean",
           description: "When task is provided, whether to block until it finishes. Defaults to false so the main agent stays responsive; set true only when the current answer depends on the result.",
         },
       },
-      required: ["name", "modelTier"],
+      required: ["name"],
       additionalProperties: false,
     } as any,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1098,10 +1112,13 @@ export default function (pi: ExtensionAPI) {
       if (!name) throw new Error("spawn_agent requires a name");
 
       const wait = typeof params.wait === "boolean" ? params.wait : false;
-      if (params.modelTier !== "fast" && params.modelTier !== "strong") {
-        throw new Error("spawn_agent requires modelTier. Ask the user whether to use fast or strong for this subagent unless they already specified it.");
+      const spawnConfig = getSpawnModelConfig(ctx);
+      if (params.modelTier !== "fast" && params.modelTier !== "strong" && spawnConfig.modelSelection === "explicit") {
+        throw new Error("spawn_agent requires modelTier because tmuxSpawn.modelSelection is explicit. Ask the user whether to use fast or strong for this subagent unless they already specified it.");
       }
-      const modelTier: SpawnModelTier = params.modelTier;
+      const modelTier: SpawnModelTier = params.modelTier === "fast" || params.modelTier === "strong"
+        ? params.modelTier
+        : inferSpawnModelTier(`${name}\n${task}`);
       const { agent, direction, reports, requestedName } = await spawnParsedAgent(name, task, ctx, {
         wait,
         reportKeys: Array.isArray(params.reportKeys) ? params.reportKeys : undefined,
@@ -1245,8 +1262,12 @@ export default function (pi: ExtensionAPI) {
       const requestedName = parsed.name;
       const name = uniqueAgentName(spawnedAgents, requestedName);
       const prompt = parsed.prompt;
+      const spawnConfig = getSpawnModelConfig(ctx);
       const explicitTier = explicitSpawnModelTier(rawInput);
-      const selectedTier = explicitTier ?? await ctx.ui.select("Spawn model", ["fast", "strong"], { placeholder: "Choose model tier for this subagent" });
+      const selectedTier = explicitTier
+        ?? (spawnConfig.modelSelection === "auto"
+          ? inferSpawnModelTier(rawInput)
+          : await ctx.ui.select("Spawn model", ["fast", "strong"], { placeholder: "Choose model tier for this subagent" }));
       if (selectedTier !== "fast" && selectedTier !== "strong") {
         ctx.ui.notify("Spawn cancelled: model tier is required", "info");
         return;

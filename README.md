@@ -30,25 +30,29 @@ The command/tool path parses the input into an agent name and task, creates a te
 
 ## Model tiers
 
-New subagents choose one immutable model at spawn time. `spawn_agent` requires an explicit `modelTier`:
+New subagents choose one immutable model at spawn time:
 
 - `fast`: defaults to `deepseek/deepseek-v4-flash`
 - `strong`: defaults to `gpt5.5`
 
-The main agent must ask the user which tier to use when the user did not explicitly specify fast or strong. Slash `/spawn` also prompts for the tier unless the input already mentions one.
+Model selection mode is configurable:
 
-Configure model IDs in `~/.pi/agent/settings.json` or `.pi/settings.json`:
+- `auto` (default): if the user does not explicitly say fast/strong, infer the tier from the task.
+- `explicit`: if the user does not explicitly say fast/strong, ask the user before spawning.
+
+Configure model IDs and selection mode in `~/.pi/agent/settings.json` or `.pi/settings.json`:
 
 ```json
 {
   "tmuxSpawn": {
     "fastModel": "deepseek/deepseek-v4-flash",
-    "strongModel": "gpt5.5"
+    "strongModel": "gpt5.5",
+    "modelSelection": "auto"
   }
 }
 ```
 
-Environment overrides are also supported: `PI_SPAWN_FAST_MODEL` and `PI_SPAWN_STRONG_MODEL`.
+Environment overrides are also supported: `PI_SPAWN_FAST_MODEL`, `PI_SPAWN_STRONG_MODEL`, and `PI_SPAWN_MODEL_SELECTION`.
 
 ## Spawned-agent name bar
 
