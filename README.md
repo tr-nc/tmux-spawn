@@ -71,7 +71,7 @@ Spawned agents are tracked by name and pane id in the main extension runtime, pe
 - Natural input like `tell bob to say hi again` is intercepted and sent directly to bob.
 - The main agent also gets spawned-agent context in its system prompt and can use the `list_spawned_agents`, `tell_spawned_agent`, `spawn_agent`, `wait_for_spawned_agent`, `collect_spawned_reports`, and `kill_spawned_agent` tools when useful.
 - If the main agent no longer needs a subagent (for example a short-term agent whose result was handled), it can call `kill_spawned_agent` on its own without asking.
-- When the main agent quits normally or starts a fresh `/new` session, all tracked spawned-agent panes are killed as well.
+- When the main agent quits normally, starts a fresh `/new` session, or reloads extensions with `/reload`, all tracked spawned-agent panes are killed as well.
 - Pane layout is stable and serialized: the main agent keeps about 60% of the window, spawned agents share the remaining 40%.
 - Additional spawned agents split inside the existing spawned-agent area, using tmux pane metadata to discover the current layout instead of relying on in-memory ordering.
 
