@@ -381,6 +381,44 @@ export default function (pi: ExtensionAPI) {
     writeFileSync(file, JSON.stringify({ agents: [...spawnedAgents.values()] }, null, 2) + "\n");
   }
 
+
+  const SNAPSHOT_CUSTOM_TYPE = "tmux-spawn.snapshot";
+
+  function snapshotAgents(): SpawnedAgent[] {
+    return [...spawnedAgents.values()].map((agent) => {
+      const copy: SpawnedAgent = { ...agent };
+      delete copy.pendingTask;
+      delete copy.pendingSince;
+      delete copy.pendingReportOffset;
+      return copy;
+    });
+  }
+
+  function appendAgentSnapshot(ctx?: ExtensionContext, reason = "update"): void {
+    if (!ctx) return;
+    try {
+      pi.appendEntry(SNAPSHOT_CUSTOM_TYPE, {
+        reason,
+        agents: snapshotAgents(),
+        timestamp: Date.now(),
+      });
+    } catch {
+      // Snapshot persistence is best effort; registry still tracks live panes.
+    }
+  }
+
+  function latestSnapshotForLeaf(ctx: ExtensionContext, leafId?: string): SpawnedAgent[] | undefined {
+    const branch = ctx.sessionManager.getBranch(leafId || ctx.sessionManager.getLeafId());
+    for (let i = branch.length - 1; i >= 0; i--) {
+      const entry = branch[i] as any;
+      if (entry?.type !== "custom" || entry.customType !== SNAPSHOT_CUSTOM_TYPE) continue;
+      const agents = entry.data?.agents;
+      if (!Array.isArray(agents)) return [];
+      return agents.filter((agent: unknown): agent is SpawnedAgent => isSpawnedAgent(agent));
+    }
+    return [];
+  }
+
   async function paneExists(paneId: string): Promise<boolean> {
     const result = await pi.exec("tmux", ["display-message", "-p", "-t", paneId, "#{pane_id}"]);
     return result.code === 0;
@@ -500,6 +538,99 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+
+  async function restoreAgentPane(agent: SpawnedAgent): Promise<SpawnedAgent | undefined> {
+    if (!existsSync(agent.configDir)) return undefined;
+    const whichPi = await pi.exec("which", ["pi"]);
+    const whichNode = await pi.exec("which", ["node"]);
+    if (whichPi.code !== 0 || whichNode.code !== 0) return undefined;
+
+    const piBin = whichPi.stdout.trim();
+    const nodeDir = join(whichNode.stdout.trim(), "..");
+    const cargoDir = join(homedir(), ".cargo", "bin");
+    const agentDir = join(homedir(), ".pi", "agent");
+    const agentBinDir = join(agentDir, "bin");
+    const signalId = `pi-spawn-idle-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const readyId = `pi-spawn-ready-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const model = agent.model || resolveSpawnModel(agent.modelTier || "fast");
+    const shellCmd = [
+      `export PATH=${shellQuote(nodeDir)}:${shellQuote(cargoDir)}:${shellQuote(agentBinDir)}:$PATH`,
+      `export PI_CODING_AGENT_DIR=${shellQuote(agent.configDir)}`,
+      `export PI_SPAWN_SIGNAL_ID=${shellQuote(signalId)}`,
+      `export PI_SPAWN_READY_ID=${shellQuote(readyId)}`,
+      `export PI_SPAWN_AGENT_NAME=${shellQuote(agent.name)}`,
+      `export PI_SPAWN_REPORT_FILE=${shellQuote(agent.reportFile)}`,
+      `trap 'tmux wait-for -U "$PI_SPAWN_SIGNAL_ID" 2>/dev/null || true' EXIT`,
+      `${shellQuote(piBin)} --model ${shellQuote(model)} --thinking off --continue`,
+    ].join("; ");
+
+    const readyLock = await pi.exec("tmux", ["wait-for", "-L", readyId]);
+    if (readyLock.code !== 0) return undefined;
+    const layout = await getSpawnLayout(agent.splitArg);
+    const result = await pi.exec("tmux", [
+      "split-window", "-t", layout.targetPaneId, "-P", "-F", "#{pane_id}",
+      layout.splitArg, "-p", layout.percent,
+      shellCmd,
+    ]);
+    if (result.code !== 0) {
+      await pi.exec("tmux", ["wait-for", "-U", readyId]);
+      return undefined;
+    }
+    const ready = await pi.exec("tmux", ["wait-for", "-L", readyId], { timeout: 15000 });
+    await pi.exec("tmux", ["wait-for", "-U", readyId]);
+    if (ready.code !== 0) return undefined;
+
+    const restored: SpawnedAgent = {
+      ...agent,
+      paneId: result.stdout.trim(),
+      signalId,
+      model,
+      splitArg: layout.splitArg,
+      pendingTask: undefined,
+      pendingSince: undefined,
+      pendingReportOffset: undefined,
+    };
+    await markSpawnPane(restored);
+    await pi.exec("tmux", ["select-pane", "-t", restored.paneId, "-T", restored.name]);
+    if (mainPaneId && await paneExists(mainPaneId)) await pi.exec("tmux", ["select-pane", "-t", mainPaneId]);
+    return restored;
+  }
+
+  async function reconcileAgentsToSnapshot(targetAgents: SpawnedAgent[], ctx: ExtensionContext): Promise<void> {
+    loadRegistry(ctx);
+    const targetByName = new Map(targetAgents.map((agent) => [agent.name, agent]));
+
+    for (const agent of [...spawnedAgents.values()]) {
+      if (targetByName.has(agent.name)) continue;
+      try {
+        const pane = await pi.exec("tmux", ["display-message", "-p", "-t", agent.paneId, "#{pane_id}"]);
+        if (pane.code === 0) await pi.exec("tmux", ["kill-pane", "-t", agent.paneId]);
+        await pi.exec("tmux", ["wait-for", "-U", agent.signalId]);
+      } catch {
+        // best effort while switching tree state
+      }
+      spawnedAgents.delete(agent.name);
+    }
+
+    for (const target of targetAgents) {
+      const current = findAgent(spawnedAgents, target.name);
+      if (current && await paneExists(current.paneId)) {
+        spawnedAgents.set(current.name, { ...target, paneId: current.paneId, signalId: current.signalId });
+        continue;
+      }
+      if (target.paneId && await paneExists(target.paneId)) {
+        spawnedAgents.set(target.name, target);
+        await markSpawnPane(target);
+        continue;
+      }
+      const restored = await restoreAgentPane(target);
+      if (restored) spawnedAgents.set(restored.name, restored);
+    }
+
+    await normalizeSpawnPaneSizes();
+    saveRegistry(ctx);
+  }
+
   async function killAgent(name: string, ctx?: ExtensionContext): Promise<{ agent: SpawnedAgent; wasRunning: boolean }> {
     loadRegistry(ctx);
     const agent = findAgent(spawnedAgents, name);
@@ -518,6 +649,7 @@ export default function (pi: ExtensionAPI) {
     spawnedAgents.delete(agent.name);
     await normalizeSpawnPaneSizes();
     saveRegistry(ctx);
+    appendAgentSnapshot(ctx, "kill");
     return { agent, wasRunning };
   }
 
@@ -538,6 +670,13 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (event, ctx) => {
     if (event.reason === "quit" || event.reason === "new" || event.reason === "reload") await killAllAgents(ctx);
+  });
+
+  pi.on("session_tree", async (event, ctx) => {
+    const targetAgents = latestSnapshotForLeaf(ctx, event.newLeafId);
+    if (!targetAgents) return;
+    await reconcileAgentsToSnapshot(targetAgents, ctx);
+    ctx.ui.notify(`Restored spawned agents for tree state: ${targetAgents.map((agent) => agent.name).join(", ") || "none"}`, "info");
   });
 
   async function sendToAgent(
@@ -593,10 +732,12 @@ export default function (pi: ExtensionAPI) {
       delete agent.pendingSince;
       delete agent.pendingReportOffset;
       saveRegistry(ctx);
+      appendAgentSnapshot(ctx, "tell");
       return { agent, reports };
     }
 
     saveRegistry(ctx);
+    appendAgentSnapshot(ctx, "tell");
     watchAgentCompletion(agent, task, beforeReportCount, ctx);
     return { agent, reports: [] };
   }
@@ -627,6 +768,7 @@ export default function (pi: ExtensionAPI) {
     delete agent.pendingSince;
     delete agent.pendingReportOffset;
     saveRegistry(ctx);
+    appendAgentSnapshot(ctx, "wait");
     return { agent, reports, wasPending };
   }
 
@@ -652,7 +794,7 @@ export default function (pi: ExtensionAPI) {
       `Task: ${notice.task || "(no task)"}`,
       resultText,
       "",
-      "Parse this spawned-agent result and reply to the user as the main interface. Be concise. If the result answers an earlier user request, provide the answer now; do not merely say that the agent finished. If this was a short-term agent and you are satisfied with the result, you may call kill_spawned_agent for this agent without asking the user."
+      "Parse this spawned-agent result and reply to the user as the main interface. Be concise. If the result answers an earlier user request, provide the answer now; do not merely say that the agent finished. Do not kill or remove the spawned agent unless the user explicitly asks."
     ].join("\n");
     try {
       pi.sendUserMessage(prompt, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
@@ -898,6 +1040,7 @@ export default function (pi: ExtensionAPI) {
     const agent: SpawnedAgent = { name, paneId, signalId, task: "", configDir, reportFile, splitArg: layout.splitArg, createdAt: nextSpawnCreatedAt(), model: spawnModel, modelTier };
     spawnedAgents.set(name, agent);
     saveRegistry(ctx);
+    appendAgentSnapshot(ctx, "spawn");
     await markSpawnPane(agent);
     await normalizeSpawnPaneSizes();
     await pi.exec("tmux", ["select-pane", "-t", paneId, "-T", name]);
@@ -931,7 +1074,6 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Kill a named /spawn tmux subagent pane",
     promptGuidelines: [
       "Use kill_spawned_agent when the user asks to despawn, kill, fire, nuke, stop, close, terminate, or remove a named spawned agent.",
-      "You may also use kill_spawned_agent on your own for short-term agents after their task is complete and their result has been handled, when preserving their session is not useful.",
       "Use list_spawned_agents first if you need to know which spawned agents exist.",
     ],
     parameters: {
@@ -1502,6 +1644,7 @@ export default function (pi: ExtensionAPI) {
       };
       spawnedAgents.set(name, agent);
       saveRegistry(ctx);
+      appendAgentSnapshot(ctx, "spawn");
       await markSpawnPane(agent);
       await normalizeSpawnPaneSizes();
 
