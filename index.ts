@@ -788,13 +788,6 @@ export default function (pi: ExtensionAPI) {
       '  pi.on("session_start", async (_event, ctx) => {',
       "    if (!ctx.hasUI) return;",
       "    ctx.ui.setTitle(`pi - ${agentName}`);",
-      "    const { CustomEditor } = await import('@earendil-works/pi-coding-agent');",
-      "    class PaneAwareEditor extends CustomEditor {",
-      "      render(_width: number): string[] {",
-      "        return [];",
-      "      }",
-      "    }",
-      "    ctx.ui.setEditorComponent((tui, theme, keybindings) => new PaneAwareEditor(tui, theme, keybindings));",
       "    ctx.ui.setStatus('spawn-agent-name', ctx.ui.theme.fg('accent', `> ${agentName}`));",
       '    ctx.ui.setHeader((_tui, theme) => ({',
       "      invalidate() {},",
@@ -823,12 +816,19 @@ export default function (pi: ExtensionAPI) {
       "      return { content: [{ type: 'text', text: 'Report sent to parent.' }] };",
       "    },",
       "  });",
+      "  async function signalReady() {",
+      '    const id = process.env.PI_SPAWN_READY_ID;',
+      "    if (!id) return;",
+      '    await pi.exec("tmux", ["wait-for", "-U", id]);',
+      '    await pi.exec("tmux", ["wait-for", "-S", id]);',
+      "  }",
       "  async function release() {",
       '    const id = process.env.PI_SPAWN_SIGNAL_ID;',
       "    if (!id) return;",
       '    await pi.exec("tmux", ["wait-for", "-U", id]);',
       '    await pi.exec("tmux", ["wait-for", "-S", id]);',
       "  }",
+      '  pi.on("session_start", signalReady);',
       '  pi.on("agent_end", async (event) => {',
       "    if (toolReportsThisTurn === 0) {",
       "      let text = '';",
@@ -855,33 +855,30 @@ export default function (pi: ExtensionAPI) {
     writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + "\n");
 
     const signalId = `pi-spawn-idle-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const readyId = `pi-spawn-ready-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const wait = options.wait ?? false;
-    const task = withReportRequest(prompt, options.reportKeys, options.reportInstructions);
     const sessionFile = ctx.sessionManager?.getSessionFile?.() ?? "";
     const parentContext = buildSpawnContext(ctx, options.contextMode ?? "none", options.contextEntryId);
     const contextLines = ["[context from parent]", `parent session: ${sessionFile}`, `cwd: ${ctx.cwd}`, `agent name: ${name}`];
     if (parentContext) contextLines.push("", "[selected parent context tree]", parentContext);
-    const contextualized = task
-      ? [...contextLines, "", task].join("\n")
-      : (parentContext ? contextLines.join("\n") : "");
+    const initialTask = prompt
+      ? [...contextLines, "", prompt].join("\n")
+      : "";
 
     const shellParts = [
       `export PATH=${shellQuote(nodeDir)}:${shellQuote(cargoDir)}:${shellQuote(agentBinDir)}:$PATH`,
       `export PI_CODING_AGENT_DIR=${shellQuote(configDir)}`,
       `export PI_SPAWN_SIGNAL_ID=${shellQuote(signalId)}`,
+      `export PI_SPAWN_READY_ID=${shellQuote(readyId)}`,
       `export PI_SPAWN_AGENT_NAME=${shellQuote(name)}`,
       `export PI_SPAWN_REPORT_FILE=${shellQuote(reportFile)}`,
       `trap 'tmux wait-for -U "$PI_SPAWN_SIGNAL_ID" 2>/dev/null || true' EXIT`,
-      task
-        ? `${shellQuote(piBin)} --model ${shellQuote(spawnModel)} --thinking off ${shellQuote(contextualized)}`
-        : `${shellQuote(piBin)} --model ${shellQuote(spawnModel)} --thinking off`,
+      `${shellQuote(piBin)} --model ${shellQuote(spawnModel)} --thinking off`,
     ];
     const shellCmd = shellParts.join("; ");
 
-    if (task) {
-      const lock = await pi.exec("tmux", ["wait-for", "-L", signalId]);
-      if (lock.code !== 0) throw new Error(`Failed to lock tmux wait channel: ${lock.stderr}`);
-    }
+    const readyLock = await pi.exec("tmux", ["wait-for", "-L", readyId]);
+    if (readyLock.code !== 0) throw new Error(`Failed to lock ready channel: ${readyLock.stderr}`);
 
     const layout = await getSpawnLayout(splitArg);
     const direction = layout.splitArg === "-v" ? "below" : "right";
@@ -891,17 +888,14 @@ export default function (pi: ExtensionAPI) {
       shellCmd,
     ]);
     if (result.code !== 0) {
-      if (task) await pi.exec("tmux", ["wait-for", "-U", signalId]);
       throw new Error(`Failed to spawn pane: ${result.stderr || "unknown error"}`);
     }
 
     const paneId = result.stdout.trim();
-    const agent: SpawnedAgent = { name, paneId, signalId, task: prompt, configDir, reportFile, splitArg: layout.splitArg, createdAt: nextSpawnCreatedAt(), model: spawnModel, modelTier };
-    if (task && !wait) {
-      agent.pendingTask = prompt;
-      agent.pendingSince = Date.now();
-      agent.pendingReportOffset = 0;
-    }
+    const ready = await pi.exec("tmux", ["wait-for", "-L", readyId], { timeout: 15000 });
+    await pi.exec("tmux", ["wait-for", "-U", readyId]);
+    if (ready.code !== 0) throw new Error(`Timed out waiting for spawned agent "${name}" to become ready`);
+    const agent: SpawnedAgent = { name, paneId, signalId, task: "", configDir, reportFile, splitArg: layout.splitArg, createdAt: nextSpawnCreatedAt(), model: spawnModel, modelTier };
     spawnedAgents.set(name, agent);
     saveRegistry(ctx);
     await markSpawnPane(agent);
@@ -913,21 +907,18 @@ export default function (pi: ExtensionAPI) {
 
     saveRegistry(ctx);
 
-    return { agent, direction, requestedName, task, wait };
+    return { agent, direction, requestedName, initialTask, wait };
     });
 
-    const { agent, direction, requestedName, task, wait } = spawned;
+    const { agent, direction, requestedName, initialTask, wait } = spawned;
     let reports: ParentReport[] = [];
-    if (task && !wait) watchAgentCompletion(agent, agent.task, 0, ctx);
-    if (task && wait) {
-      const done = await pi.exec("tmux", ["wait-for", "-L", agent.signalId]);
-      await pi.exec("tmux", ["wait-for", "-U", agent.signalId]);
-      if (done.code !== 0) throw new Error(`Failed while waiting for agent "${agent.name}": ${done.stderr}`);
-      reports = readReports(agent);
-      delete agent.pendingTask;
-      delete agent.pendingSince;
-      delete agent.pendingReportOffset;
-      saveRegistry(ctx);
+    if (initialTask) {
+      const sent = await sendToAgent(agent.name, initialTask, ctx, {
+        wait,
+        reportKeys: options.reportKeys,
+        reportInstructions: options.reportInstructions,
+      });
+      reports = sent.reports;
     }
 
     return { agent, direction, reports, requestedName };
@@ -1374,13 +1365,6 @@ export default function (pi: ExtensionAPI) {
         '  pi.on("session_start", async (_event, ctx) => {',
         "    if (!ctx.hasUI) return;",
         "    ctx.ui.setTitle(`pi - ${agentName}`);",
-        "    const { CustomEditor } = await import('@earendil-works/pi-coding-agent');",
-        "    class PaneAwareEditor extends CustomEditor {",
-        "      render(_width: number): string[] {",
-        "        return [];",
-        "      }",
-        "    }",
-        "    ctx.ui.setEditorComponent((tui, theme, keybindings) => new PaneAwareEditor(tui, theme, keybindings));",
         '    ctx.ui.setHeader((_tui, theme) => ({',
         "      invalidate() {},",
         "      render(_width: number): string[] {",
@@ -1408,12 +1392,19 @@ export default function (pi: ExtensionAPI) {
         "      return { content: [{ type: 'text', text: 'Report sent to parent.' }] };",
         "    },",
         "  });",
+        "  async function signalReady() {",
+        '    const id = process.env.PI_SPAWN_READY_ID;',
+        "    if (!id) return;",
+        '    await pi.exec("tmux", ["wait-for", "-U", id]);',
+        '    await pi.exec("tmux", ["wait-for", "-S", id]);',
+        "  }",
         "  async function release() {",
         '    const id = process.env.PI_SPAWN_SIGNAL_ID;',
         "    if (!id) return;",
         '    await pi.exec("tmux", ["wait-for", "-U", id]);',
         '    await pi.exec("tmux", ["wait-for", "-S", id]);',
         "  }",
+        '  pi.on("session_start", signalReady);',
         '  pi.on("agent_end", async (event) => {',
         "    if (toolReportsThisTurn === 0) {",
         "      let text = '';",
@@ -1440,51 +1431,38 @@ export default function (pi: ExtensionAPI) {
 
       writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + "\n");
 
-      // build shell command with a signal for when the subagent becomes idle
+      // Build an interactive subagent first, then send any initial task via
+      // tmux keys. Passing the task as a pi CLI argument can terminate the pane
+      // after startup before the TUI agent actually handles the task.
       const signalId = `pi-spawn-idle-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      let shellCmd: string;
-      if (prompt) {
-        const sessionFile = ctx.sessionManager?.getSessionFile?.() ?? "";
-        const cwd = ctx.cwd;
-        const contextualized = [
+      const readyId = `pi-spawn-ready-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const sessionFile = ctx.sessionManager?.getSessionFile?.() ?? "";
+      const cwd = ctx.cwd;
+      const initialTask = prompt
+        ? [
           "[context from parent]",
           `parent session: ${sessionFile}`,
           `cwd: ${cwd}`,
           `agent name: ${name}`,
           "",
           prompt,
-        ].join("\n");
+        ].join("\n")
+        : "";
+      const shellCmd = [
+        `export PATH=${shellQuote(nodeDir)}:${shellQuote(cargoDir)}:${shellQuote(agentBinDir)}:$PATH`,
+        `export PI_CODING_AGENT_DIR=${shellQuote(configDir)}`,
+        `export PI_SPAWN_SIGNAL_ID=${shellQuote(signalId)}`,
+        `export PI_SPAWN_READY_ID=${shellQuote(readyId)}`,
+        `export PI_SPAWN_AGENT_NAME=${shellQuote(name)}`,
+        `export PI_SPAWN_REPORT_FILE=${shellQuote(reportFile)}`,
+        `trap 'tmux wait-for -U "$PI_SPAWN_SIGNAL_ID" 2>/dev/null || true' EXIT`,
+        `${shellQuote(piBin)} --model ${shellQuote(spawnModel)} --thinking off`,
+      ].join("; ");
 
-        shellCmd = [
-          `export PATH=${shellQuote(nodeDir)}:${shellQuote(cargoDir)}:${shellQuote(agentBinDir)}:$PATH`,
-          `export PI_CODING_AGENT_DIR=${shellQuote(configDir)}`,
-          `export PI_SPAWN_SIGNAL_ID=${shellQuote(signalId)}`,
-          `export PI_SPAWN_AGENT_NAME=${shellQuote(name)}`,
-          `export PI_SPAWN_REPORT_FILE=${shellQuote(reportFile)}`,
-          `trap 'tmux wait-for -U "$PI_SPAWN_SIGNAL_ID" 2>/dev/null || true' EXIT`,
-          `${shellQuote(piBin)} --model ${shellQuote(spawnModel)} --thinking off ${shellQuote(contextualized)}`,
-        ].join("; ");
-      } else {
-        shellCmd = [
-          `export PATH=${shellQuote(nodeDir)}:${shellQuote(cargoDir)}:${shellQuote(agentBinDir)}:$PATH`,
-          `export PI_CODING_AGENT_DIR=${shellQuote(configDir)}`,
-          `export PI_SPAWN_SIGNAL_ID=${shellQuote(signalId)}`,
-          `export PI_SPAWN_AGENT_NAME=${shellQuote(name)}`,
-          `export PI_SPAWN_REPORT_FILE=${shellQuote(reportFile)}`,
-          `trap 'tmux wait-for -U "$PI_SPAWN_SIGNAL_ID" 2>/dev/null || true' EXIT`,
-          `${shellQuote(piBin)} --model ${shellQuote(spawnModel)} --thinking off`,
-        ].join("; ");
-      }
-
-      // Race-free block: pre-lock the channel before spawn. The injected
-      // subagent extension unlocks it on agent_end; then this command's second
-      // -L call returns and the parent can notify completion.
-      if (prompt) {
-        const lock = await pi.exec("tmux", ["wait-for", "-L", signalId]);
-        if (lock.code !== 0) {
-          ctx.ui.notify(`Failed to lock tmux wait channel: ${lock.stderr}`, "error");
-          return;
-        }
+      const readyLock = await pi.exec("tmux", ["wait-for", "-L", readyId]);
+      if (readyLock.code !== 0) {
+        ctx.ui.notify(`Failed to lock ready channel: ${readyLock.stderr}`, "error");
+        return;
       }
 
       const layout = await getSpawnLayout(splitArg);
@@ -1496,7 +1474,6 @@ export default function (pi: ExtensionAPI) {
       ]);
 
       if (result.code !== 0) {
-        if (prompt) await pi.exec("tmux", ["wait-for", "-U", signalId]);
         ctx.ui.notify(
           `Failed to spawn pane: ${result.stderr || "unknown error"}`,
           "error",
@@ -1505,11 +1482,17 @@ export default function (pi: ExtensionAPI) {
       }
 
       const paneId = result.stdout.trim();
+      const ready = await pi.exec("tmux", ["wait-for", "-L", readyId], { timeout: 15000 });
+      await pi.exec("tmux", ["wait-for", "-U", readyId]);
+      if (ready.code !== 0) {
+        ctx.ui.notify(`Timed out waiting for spawned agent "${name}" to become ready`, "error");
+        return;
+      }
       const agent: SpawnedAgent = {
         name,
         paneId,
         signalId,
-        task: prompt,
+        task: "",
         configDir,
         reportFile,
         splitArg: layout.splitArg,
@@ -1517,11 +1500,6 @@ export default function (pi: ExtensionAPI) {
         model: spawnModel,
         modelTier,
       };
-      if (prompt) {
-        agent.pendingTask = prompt;
-        agent.pendingSince = Date.now();
-        agent.pendingReportOffset = 0;
-      }
       spawnedAgents.set(name, agent);
       saveRegistry(ctx);
       await markSpawnPane(agent);
@@ -1541,11 +1519,13 @@ export default function (pi: ExtensionAPI) {
         ? `Spawned "${name}" ${direction}${renamed}${modelNote}\nTask assigned in background: ${prompt}`
         : `Spawned "${name}" ${direction}${renamed}${modelNote}`;
       ctx.ui.notify(note, "info");
-      return { agent, prompt };
+      return { agent, prompt: initialTask };
       });
       if (!spawned) return;
 
-      if (spawned.prompt) watchAgentCompletion(spawned.agent, spawned.prompt, 0, ctx);
+      if (spawned.prompt) {
+        await sendToAgent(spawned.agent.name, spawned.prompt, ctx, { wait: false });
+      }
     },
   });
 }
